@@ -55,7 +55,7 @@ MemDepUnit::MemDepUnit() : iqPtr(NULL), stats(nullptr) {}
 
 MemDepUnit::MemDepUnit(const BaseO3CPUParams &params)
     : _name(params.name + ".memdepunit"),
-      depPred(_name + ".storesets", params.store_set_clear_period,
+      depPred(_name + ".phast", params.store_set_clear_period,
               params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
               params.SSITIndexingPolicy, params.LFSTSize),
       iqPtr(NULL),

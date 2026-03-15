@@ -51,7 +51,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/limits.hh"
-#include "cpu/o3/store_set.hh"
+#include "cpu/o3/phast.hh"
 #include "debug/MemDepUnit.hh"
 
 namespace gem5
@@ -241,7 +241,7 @@ class MemDepUnit
      *  this unit what instruction the newly added instruction is dependent
      *  upon.
      */
-    StoreSet depPred;
+    Phast depPred;
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
