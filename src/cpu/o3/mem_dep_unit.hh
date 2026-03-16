@@ -52,6 +52,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/phast.hh"
+#include "cpu/o3/store_set.hh"
 #include "debug/MemDepUnit.hh"
 
 namespace gem5
@@ -162,7 +163,7 @@ class MemDepUnit
     void dumpLists();
 
     /** Get the Phast predictor. */
-    Phast* getPhast() { return &depPred; }
+    Phast* getPhast() { return &phastPred; }
 
   private:
 
@@ -239,12 +240,14 @@ class MemDepUnit
     /** A list of all instructions that are going to be replayed. */
     std::list<DynInstPtr> instsToReplay;
 
-    /** The memory dependence predictor.  It is accessed upon new
-     *  instructions being added to the IQ, and responds by telling
-     *  this unit what instruction the newly added instruction is dependent
-     *  upon.
-     */
-    Phast depPred;
+    /** If the StoreSet predictor should be used instead of Phast. */
+    bool useStoreSet;
+
+    /** The Phast memory dependence predictor. */
+    Phast phastPred;
+
+    /** The StoreSet memory dependence predictor. */
+    StoreSet ssPred;
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
