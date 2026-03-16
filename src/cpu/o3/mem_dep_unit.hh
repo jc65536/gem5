@@ -161,6 +161,9 @@ class MemDepUnit
     /** Debugging function to dump the lists of instructions. */
     void dumpLists();
 
+    /** Get the Phast predictor. */
+    Phast* getPhast() { return &depPred; }
+
   private:
 
     /** Completes a memory instruction. */

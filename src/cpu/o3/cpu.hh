@@ -548,6 +548,9 @@ class CPU : public BaseCPU
     /** The global FT sequence number counter. */
     FTSeqNum globalFTSeqNum;
 
+    /** Get the Phast predictor. */
+    Phast* getPhast(ThreadID tid) { return iew.instQueue.getPhast(tid); }
+
     /** Pointer to the checker, which can dynamically verify
      * instruction results at run time.  This can be set to NULL if it
      * is not being used.

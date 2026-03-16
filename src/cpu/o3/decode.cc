@@ -682,6 +682,20 @@ Decode::decodeInsts(ThreadID tid)
             continue;
         }
 
+        // PHAST: Tracking
+        auto phast = cpu->getPhast(tid);
+        // PHAST: snapshot global branch count for loads and stores
+        if (inst->isLoad() || inst->isStore() || inst->isAtomic()) {
+            inst->phastDecodeBranchCount = phast->getBranchCount();
+        }
+
+        // PHAST: record divergent branches
+        if (inst->isControl() && (inst->isCondCtrl() || inst->isIndirectCtrl())) {
+            bool taken = inst->readPredTaken();
+            Addr target = inst->readPredTarg().instAddr();
+            phast->recordBranch(inst->isIndirectCtrl(), taken, target);
+        }
+
         // Also check if instructions have no source registers.  Mark
         // them as ready to issue at any time.  Not sure if this check
         // should exist here or at a later stage; however it doesn't matter

@@ -398,6 +398,10 @@ class InstructionQueue
      */
     MemDepUnit memDepUnit[MaxThreads];
 
+  public:
+    Phast* getPhast(ThreadID tid) { return memDepUnit[tid].getPhast(); }
+
+  private:
     /** The queue to the execute stage.  Issued instructions will be written
      *  into it.
      */

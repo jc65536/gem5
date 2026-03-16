@@ -794,6 +794,10 @@ Commit::commit()
                     tid,
                     fromIEW->mispredictInst[tid]->pcState().instAddr(),
                     fromIEW->squashedSeqNum[tid]);
+
+                // PHAST: Restore branch counter
+                auto phast = cpu->getPhast(tid);
+                phast->squashBranches(fromIEW->mispredictInst[tid]->phastDecodeBranchCount);
             } else {
                 DPRINTF(Commit,
                     "[tid:%i] Squashing due to order violation [sn:%llu]\n",
@@ -1269,6 +1273,12 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     // the HTM UID is purely for correctness and debugging purposes
     if (head_inst->isHtmStart())
         iewStage->setLastRetiredHtmUid(tid, head_inst->getHtmTransactionUid());
+
+    // PHAST: Update confidence on successful load commit
+    if (head_inst->isLoad()) {
+        auto phast = cpu->getPhast(tid);
+        phast->updateConfidence(head_inst);
+    }
 
     // Finally clear the head ROB entry.
     rob->retireHead(tid);

@@ -1,38 +1,11 @@
-/*
- * Copyright (c) 2004-2006 The Regents of The University of Michigan
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met: redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer;
- * redistributions in binary form must reproduce the above copyright
- * notice, this list of conditions and the following disclaimer in the
- * documentation and/or other materials provided with the distribution;
- * neither the name of the copyright holders nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+#include "cpu/o3/phast.hh"
 
+#include <algorithm>
 #include "base/intmath.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
-#include "cpu/o3/phast.hh"
+#include "cpu/o3/dyn_inst.hh"
 #include "debug/Phast.hh"
-#include "mem/cache/tags/indexing_policies/base.hh"
-#include "mem/cache/replacement_policies/base.hh"
 
 namespace gem5
 {
@@ -41,38 +14,21 @@ namespace o3
 {
 
 Phast::Phast(std::string_view name_, uint64_t clear_period,
-                   size_t _SSIT_entries, int _SSIT_assoc,
-                   replacement_policy::Base *_replPolicy,
-                   BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
+             size_t _SSIT_entries, int _SSIT_assoc,
+             replacement_policy::Base *_replPolicy,
+             BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
   : Named(name_),
-    SSIT("SSIT", _SSIT_entries, _SSIT_assoc,
-	 _replPolicy, _indexingPolicy,
-	 SSITEntry(genTagExtractor(_indexingPolicy))),
-    clearPeriod(clear_period), SSITSize(_SSIT_entries),
-    LFSTSize(_LFST_size)
+    globalDivergentBranchCounter(0),
+    globalHistoryBuffer(512, 0),
+    recentStores(1024, 0),
+    storeIndex(0),
+    clearPeriod(clear_period),
+    memOpsPred(0)
 {
-    DPRINTF(Phast, "Phast: Creating store set object.\n");
-    DPRINTF(Phast, "Phast: SSIT size: %i, LFST size: %i.\n",
-            SSITSize, LFSTSize);
-
-    if (!isPowerOf2(SSITSize)) {
-        fatal("Invalid SSIT size!\n");
+    DPRINTF(Phast, "Phast: Creating PHAST object.\n");
+    for (int len : HISTORY_LENGTHS) {
+        tables.emplace_back(len);
     }
-
-    if (!isPowerOf2(LFSTSize)) {
-        fatal("Invalid LFST size!\n");
-    }
-
-    LFST.resize(LFSTSize);
-
-    validLFST.resize(LFSTSize);
-
-    for (int i = 0; i < LFSTSize; ++i) {
-        validLFST[i] = false;
-        LFST[i] = 0;
-    }
-
-    memOpsPred = 0;
 }
 
 Phast::~Phast()
@@ -81,99 +37,144 @@ Phast::~Phast()
 
 void
 Phast::init(uint64_t clear_period, size_t _SSIT_entries,
-               int _SSIT_assoc, replacement_policy::Base *_replPolicy,
-               BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
+            int _SSIT_assoc, replacement_policy::Base *_replPolicy,
+            BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
 {
-    SSITSize = _SSIT_entries;
-    LFSTSize = _LFST_size;
     clearPeriod = clear_period;
-
-    DPRINTF(Phast, "Phast: Creating store set object.\n");
-    DPRINTF(Phast, "Phast: SSIT size: %i, LFST size: %i.\n",
-            SSITSize, LFSTSize);
-
-    SSIT.init(SSITSize, _SSIT_assoc, _replPolicy, _indexingPolicy,
-	      SSITEntry(genTagExtractor(_indexingPolicy)));
-
-    LFST.resize(LFSTSize);
-
-    validLFST.resize(LFSTSize);
-
-    for (int i = 0; i < LFSTSize; ++i) {
-        validLFST[i] = false;
-        LFST[i] = 0;
-    }
-
     memOpsPred = 0;
+    globalDivergentBranchCounter = 0;
+    globalHistoryBuffer.assign(512, 0);
+    recentStores.assign(1024, 0);
+    storeIndex = 0;
+    
+    tables.clear();
+    for (int len : HISTORY_LENGTHS) {
+        tables.emplace_back(len);
+    }
 }
 
+void
+Phast::recordBranch(bool is_indirect, bool is_taken, Addr target)
+{
+    uint8_t hist_entry = 0;
+    if (is_indirect) hist_entry |= (1 << 6);
+    if (is_taken) hist_entry |= (1 << 5);
+    uint8_t target_bits = (target >> 2) & 0x1F;
+    hist_entry |= target_bits;
+
+    globalHistoryBuffer[globalDivergentBranchCounter % 512] = hist_entry;
+    globalDivergentBranchCounter++;
+}
+
+uint32_t
+Phast::foldHistory(uint64_t load_branch_count, int hist_len) const
+{
+    uint32_t folded = 0;
+    for (int i = 0; i < hist_len; ++i) {
+        if (load_branch_count <= i) break;
+        uint64_t idx = load_branch_count - 1 - i;
+        uint8_t branch_hist = globalHistoryBuffer[idx % 512];
+        folded = (folded << 3) | (folded >> 20); // Rotate left by 3
+        folded ^= branch_hist;
+    }
+    return folded & 0x7FFFFF; // Mask to 23 bits
+}
 
 void
-Phast::violation(Addr store_PC, Addr load_PC)
+Phast::getIndexAndTag(Addr pc, uint32_t folded_hist, int &index, uint16_t &tag) const
 {
-    auto ld_entry = SSIT.findEntry({load_PC});
-    auto st_entry = SSIT.findEntry({store_PC});
+    Addr hash_pc_idx = pc ^ (pc >> 2) ^ (pc >> 5);
+    index = (hash_pc_idx ^ folded_hist) % NUM_SETS;
 
-    bool valid_load_SSID  = ld_entry && ld_entry->isValid();
-    bool valid_store_SSID = st_entry && st_entry->isValid();
+    Addr hash_pc_tag = (pc >> 3) ^ (pc >> 7);
+    tag = (hash_pc_tag ^ folded_hist) & 0xFFFF;
+}
 
-    if (!valid_load_SSID && !valid_store_SSID) {
-        // Calculate a new SSID here.
-        SSID new_set = calcSSID(load_PC);
-
-        assert(new_set < LFSTSize);
-
-        SSITEntry *ld_entry = SSIT.findVictim({load_PC});
-        ld_entry->setSSID(new_set);
-        SSIT.insertEntry({load_PC}, ld_entry);
-
-        SSITEntry *st_entry = SSIT.findVictim({store_PC});
-        st_entry->setSSID(new_set);
-        SSIT.insertEntry({store_PC}, st_entry);
-
-        DPRINTF(Phast, "Phast: Neither load nor store had a valid "
-                "storeset, creating a new one: %i for load %#x, store %#x\n",
-                new_set, load_PC, store_PC);
-    } else if (valid_load_SSID && !valid_store_SSID) {
-        SSID load_SSID = ld_entry->getSSID();
-        SSITEntry *st_entry = SSIT.findVictim({store_PC});
-        st_entry->setSSID(load_SSID);
-        SSIT.insertEntry({store_PC}, st_entry);
-
-        assert(load_SSID < LFSTSize);
-
-        DPRINTF(Phast, "Phast: Load had a valid store set.  Adding "
-                "store to that set: %i for load %#x, store %#x\n",
-                load_SSID, load_PC, store_PC);
-    } else if (!valid_load_SSID && valid_store_SSID) {
-        SSID store_SSID = st_entry->getSSID();
-        SSITEntry *ld_entry = SSIT.findVictim({load_PC});
-        ld_entry->setSSID(store_SSID);
-        SSIT.insertEntry({load_PC}, ld_entry);
-
-        DPRINTF(Phast, "Phast: Store had a valid store set: %i for "
-                "load %#x, store %#x\n",
-                store_SSID, load_PC, store_PC);
-    } else {
-        SSID load_SSID = ld_entry->getSSID();
-        SSID store_SSID = st_entry->getSSID();
-
-        assert(load_SSID < LFSTSize && store_SSID < LFSTSize);
-
-        // The store set with the lower number wins
-        if (store_SSID > load_SSID) {
-            st_entry->setSSID(load_SSID);
-
-            DPRINTF(Phast, "Phast: Load had smaller store set: %i; "
-                    "for load %#x, store %#x\n",
-                    load_SSID, load_PC, store_PC);
-        } else {
-            ld_entry->setSSID(store_SSID);
-
-            DPRINTF(Phast, "Phast: Store had smaller store set: %i; "
-                    "for load %#x, store %#x\n",
-                    store_SSID, load_PC, store_PC);
+void
+Phast::updateLRU(std::vector<PhastEntry>& set, int accessed_way)
+{
+    uint8_t current_lru = set[accessed_way].lru;
+    if (!set[accessed_way].valid) {
+        current_lru = NUM_WAYS - 1; // Max LRU
+    }
+    
+    for (int i = 0; i < NUM_WAYS; ++i) {
+        if (set[i].valid && set[i].lru < current_lru) {
+            set[i].lru++;
         }
+    }
+    set[accessed_way].lru = 0;
+}
+
+void
+Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
+{
+    int actual_store_dist = -1;
+    for (int i = 0; i < recentStores.size(); ++i) {
+        if (storeIndex <= i) break;
+        if (storeDistToSeqNum(i) == store_inst->seqNum) {
+            actual_store_dist = i;
+            break;
+        }
+    }
+
+    if (actual_store_dist == -1) return; // Store too old, fallen off recent stores
+    if (actual_store_dist > 127) actual_store_dist = 127; // Max 7-bit distance
+
+    int hist_len = 0;
+    if (load_inst->phastDecodeBranchCount > store_inst->phastDecodeBranchCount) {
+        hist_len = load_inst->phastDecodeBranchCount - store_inst->phastDecodeBranchCount;
+    }
+
+    int target_table_idx = tables.size() - 1;
+    for (int t = 0; t < tables.size(); ++t) {
+        if (tables[t].historyLength >= hist_len) {
+            target_table_idx = t;
+            break;
+        }
+    }
+    hist_len = tables[target_table_idx].historyLength;
+
+    if (hist_len > load_inst->phastDecodeBranchCount) return;
+
+    Addr pc = load_inst->pcState().instAddr();
+    uint32_t folded = foldHistory(load_inst->phastDecodeBranchCount, hist_len);
+    int index;
+    uint16_t tag;
+    getIndexAndTag(pc, folded, index, tag);
+
+    auto& set = tables[target_table_idx].sets[index];
+
+    int hit_way = -1;
+    for (int w = 0; w < NUM_WAYS; ++w) {
+        if (set[w].valid && set[w].tag == tag) {
+            hit_way = w;
+            break;
+        }
+    }
+
+    if (hit_way != -1) {
+        set[hit_way].storeDist = actual_store_dist;
+        set[hit_way].confidence = MAX_CONFIDENCE;
+        updateLRU(set, hit_way);
+    } else {
+        int repl_way = 0;
+        int max_lru = -1;
+        for (int w = 0; w < NUM_WAYS; ++w) {
+            if (!set[w].valid) {
+                repl_way = w;
+                break;
+            }
+            if (set[w].lru > max_lru) {
+                max_lru = set[w].lru;
+                repl_way = w;
+            }
+        }
+        set[repl_way].valid = true;
+        set[repl_way].tag = tag;
+        set[repl_way].storeDist = actual_store_dist;
+        set[repl_way].confidence = MAX_CONFIDENCE;
+        updateLRU(set, repl_way);
     }
 }
 
@@ -182,15 +183,13 @@ Phast::checkClear()
 {
     memOpsPred++;
     if (memOpsPred > clearPeriod) {
-        DPRINTF(Phast, "Wiping predictor state beacuse %d ld/st executed\n",
-                clearPeriod);
-        memOpsPred = 0;
+        DPRINTF(Phast, "Wiping predictor state\n");
         clear();
     }
 }
 
 void
-Phast::insertLoad(Addr load_PC, InstSeqNum load_seq_num)
+Phast::insertLoad(const DynInstPtr &load_inst)
 {
     checkClear();
     // Does nothing.
@@ -198,161 +197,116 @@ Phast::insertLoad(Addr load_PC, InstSeqNum load_seq_num)
 }
 
 void
-Phast::insertStore(Addr store_PC, InstSeqNum store_seq_num, ThreadID tid)
+Phast::insertStore(const DynInstPtr &store_inst)
 {
-    auto st_entry = SSIT.findEntry({store_PC});
-
-    bool valid_entry = st_entry && st_entry->isValid();
-
-    int store_SSID;
-
     checkClear();
-
-    if (!valid_entry) {
-        // Do nothing if there's no valid entry.
-        return;
-    } else {
-        store_SSID = st_entry->getSSID();
-
-        assert(store_SSID < LFSTSize);
-
-        // Update the last store that was fetched with the current one.
-        LFST[store_SSID] = store_seq_num;
-
-        validLFST[store_SSID] = 1;
-
-        storeList[store_seq_num] = store_SSID;
-
-        DPRINTF(Phast, "Store %#x updated the LFST, SSID: %i\n",
-                store_PC, store_SSID);
-    }
+    recentStores[storeIndex % recentStores.size()] = store_inst->seqNum;
+    storeIndex++;
 }
 
 InstSeqNum
-Phast::checkInst(Addr PC)
+Phast::checkInst(const DynInstPtr &load_inst)
 {
-    auto entry = SSIT.findEntry({PC});
-    bool valid_ssit = entry && entry->isValid();
+    int best_store_dist = -1;
+    int best_hist_len = -1;
+    std::vector<PhastEntry> *best_set = nullptr;
+    int best_way = -1;
+    Addr pc = load_inst->pcState().instAddr();
+    uint64_t load_branch_count = load_inst->phastDecodeBranchCount;
 
-    int inst_SSID;
+    for (int t = 0; t < tables.size(); ++t) {
+        int hist_len = tables[t].historyLength;
+        if (hist_len > load_branch_count) continue; 
 
-    if (!valid_ssit) {
-        DPRINTF(Phast, "Inst %#x has no SSID\n", PC);
+        uint32_t folded = foldHistory(load_branch_count, hist_len);
+        int index;
+        uint16_t tag;
+        getIndexAndTag(pc, folded, index, tag);
 
-        // Return 0 if there's no valid entry.
-        return 0;
-    } else {
-        inst_SSID = entry->getSSID();
-
-        assert(inst_SSID < LFSTSize);
-
-        if (!validLFST[inst_SSID]) {
-
-            DPRINTF(Phast, "Inst %#x with SSID %i had no "
-                    "dependency\n", PC, inst_SSID);
-
-            return 0;
-        } else {
-            DPRINTF(Phast, "Inst %#x with SSID %i had LFST "
-                    "inum of %i\n", PC, inst_SSID, LFST[inst_SSID]);
-
-            return LFST[inst_SSID];
+        auto& set = tables[t].sets[index];
+        for (int w = 0; w < NUM_WAYS; ++w) {
+            if (set[w].valid && set[w].tag == tag && set[w].confidence > 0) {
+                if (hist_len > best_hist_len) {
+                    best_hist_len = hist_len;
+                    best_store_dist = set[w].storeDist;
+                    best_set = &set;
+                    best_way = w;
+                }
+                updateLRU(set, w); 
+                break;
+            }
         }
+    }
+
+    if (best_store_dist >= 0) {
+        load_inst->predictedEntrySetPtr = best_set;
+        load_inst->predictedWayInSet = best_way;
+        return storeDistToSeqNum(best_store_dist);
+    } else {
+        return 0; // 0 means no dependence
     }
 }
 
 void
 Phast::issued(Addr issued_PC, InstSeqNum issued_seq_num, bool is_store)
 {
-    // This only is updated upon a store being issued.
-    if (!is_store) {
-        return;
-    }
-
-    auto entry = SSIT.findEntry({issued_PC});
-    bool valid_ssit = entry && entry->isValid();
-
-    int store_SSID;
-
-    SeqNumMapIt store_list_it = storeList.find(issued_seq_num);
-
-    if (store_list_it != storeList.end()) {
-        storeList.erase(store_list_it);
-    }
-
-    // Make sure the SSIT still has a valid entry for the issued store.
-    if (!valid_ssit) {
-        return;
-    }
-
-    store_SSID = entry->getSSID();
-
-    assert(store_SSID < LFSTSize);
-
-    // If the last fetched store in the store set refers to the store that
-    // was just issued, then invalidate the entry.
-    if (validLFST[store_SSID] && LFST[store_SSID] == issued_seq_num) {
-        DPRINTF(Phast, "Phast: store invalidated itself in LFST.\n");
-        validLFST[store_SSID] = false;
-    }
 }
 
 void
 Phast::squash(InstSeqNum squashed_num, ThreadID tid)
 {
-    DPRINTF(Phast, "Phast: Squashing until inum %i\n",
-            squashed_num);
-
-    int idx;
-    SeqNumMapIt store_list_it = storeList.begin();
-
-    //@todo:Fix to only delete from correct thread
-    while (!storeList.empty()) {
-        idx = (*store_list_it).second;
-
-        if ((*store_list_it).first <= squashed_num) {
+    while (storeIndex > 0) {
+        if (storeDistToSeqNum(0) > squashed_num) {
+            storeIndex--;
+        } else {
             break;
         }
+    }
+}
 
-        bool younger = LFST[idx] > squashed_num;
+void
+Phast::updateConfidence(const DynInstPtr &load_inst)
+{
+    if (!load_inst->predictedEntrySetPtr || load_inst->predictedWayInSet < 0) {
+        return;
+    }
 
-        if (validLFST[idx] && younger) {
-            DPRINTF(Phast, "Squashed [sn:%lli]\n", LFST[idx]);
-            validLFST[idx] = false;
+    std::vector<PhastEntry> &set = *(load_inst->predictedEntrySetPtr);
+    int w = load_inst->predictedWayInSet;
 
-            storeList.erase(store_list_it++);
-        } else if (!validLFST[idx] && younger) {
-            storeList.erase(store_list_it++);
+    if (set[w].valid) {
+        InstSeqNum predicted_forwarding_store_seq_num = storeDistToSeqNum(set[w].storeDist);
+        bool is_correct = load_inst->forwardingStoreSeqNum == predicted_forwarding_store_seq_num;
+        if (is_correct) {
+            set[w].confidence = MAX_CONFIDENCE;
+        } else if (set[w].confidence > 0) {
+            set[w].confidence--;
         }
+        updateLRU(set, w);
     }
 }
 
 void
 Phast::clear()
 {
-    SSIT.clear();
-
-    for (int i = 0; i < LFSTSize; ++i) {
-        validLFST[i] = false;
+    for (auto& table : tables) {
+        for (auto& set : table.sets) {
+            for (auto& entry : set) {
+                entry.valid = false;
+                entry.confidence = 0;
+            }
+        }
     }
-
-    storeList.clear();
+    memOpsPred = 0;
 }
 
 void
 Phast::dump()
 {
-    cprintf("storeList.size(): %i\n", storeList.size());
-    SeqNumMapIt store_list_it = storeList.begin();
+}
 
-    int num = 0;
-
-    while (store_list_it != storeList.end()) {
-        cprintf("%i: [sn:%lli] SSID:%i\n",
-                num, (*store_list_it).first, (*store_list_it).second);
-        num++;
-        store_list_it++;
-    }
+InstSeqNum Phast::storeDistToSeqNum(int store_dist) const {
+    return recentStores[(storeIndex - 1 - store_dist) % recentStores.size()];
 }
 
 } // namespace o3

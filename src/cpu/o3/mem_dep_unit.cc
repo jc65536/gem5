@@ -222,7 +222,7 @@ MemDepUnit::insert(const DynInstPtr &inst)
                                 std::begin(storeBarrierSNs),
                                 std::end(storeBarrierSNs));
     } else {
-        InstSeqNum dep = depPred.checkInst(inst->pcState().instAddr());
+        InstSeqNum dep = depPred.checkInst(inst);
         if (dep != 0)
             producing_stores.push_back(dep);
     }
@@ -288,8 +288,7 @@ MemDepUnit::insert(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        depPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
-                inst->threadNumber);
+        depPred.insertStore(inst);
 
         ++stats.insertedStores;
     } else if (inst->isLoad()) {
@@ -310,8 +309,7 @@ MemDepUnit::insertNonSpec(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        depPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
-                inst->threadNumber);
+        depPred.insertStore(inst);
 
         ++stats.insertedStores;
     } else if (inst->isLoad()) {
@@ -577,8 +575,7 @@ MemDepUnit::violation(const DynInstPtr &store_inst,
             " load: %#x, store: %#x\n", violating_load->pcState().instAddr(),
             store_inst->pcState().instAddr());
     // Tell the memory dependence unit of the violation.
-    depPred.violation(store_inst->pcState().instAddr(),
-            violating_load->pcState().instAddr());
+    depPred.violation(store_inst, violating_load);
 }
 
 void

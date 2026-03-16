@@ -58,6 +58,7 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/lsq_unit.hh"
+#include "cpu/o3/phast.hh"
 #include "cpu/op_class.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst.hh"
@@ -355,6 +356,17 @@ class DynInst : public ExecContext, public RefCounted
     /** Store queue index. */
     ssize_t sqIdx = -1;
     typename LSQUnit::SQIterator sqIt;
+
+    /////////////////////// PHAST Memory Dependence Data //////////////////////
+    /** Snapshot of the global divergent branch count at decode. */
+    uint64_t phastDecodeBranchCount = 0;
+
+    /** The sequence number of the store that forwarded data to this load. */
+    InstSeqNum forwardingStoreSeqNum = 0;
+
+    /** Prediction info for confidence update at commit */
+    std::vector<PhastEntry> *predictedEntrySetPtr = nullptr;
+    int predictedWayInSet = -1;
 
 
     /////////////////////// TLB Miss //////////////////////

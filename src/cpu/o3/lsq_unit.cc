@@ -574,6 +574,15 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                         " between instructions [sn:%lli] and [sn:%lli]\n",
                         inst_eff_addr1, inst->seqNum, ld_inst->seqNum);
             } else {
+                // PHAST: Filtering squashes on store-to-load forwarding.
+                // If the load received data from a younger store (which is still older than the load),
+                // it should not be squashed by this older executing store.
+                if (ld_inst->forwardingStoreSeqNum != 0 &&
+                    ld_inst->forwardingStoreSeqNum > inst->seqNum) {
+                    ++loadIt;
+                    continue;
+                }
+
                 // A load/store incorrectly passed this store.
                 // Check if we already have a violator, or if it's newer
                 // squash and refetch.
@@ -1492,6 +1501,9 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 DPRINTF(LSQUnit, "Forwarding from store idx %i to load to "
                         "addr %#x\n", store_it._idx,
                         request->mainReq()->getVaddr());
+
+                // PHAST: Record forwarding store sequence number
+                load_inst->forwardingStoreSeqNum = store_it->instruction()->seqNum;
 
                 PacketPtr data_pkt = new Packet(request->mainReq(),
                         MemCmd::ReadReq);
