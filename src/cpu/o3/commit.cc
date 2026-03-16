@@ -797,11 +797,26 @@ Commit::commit()
 
                 // PHAST: Restore branch counter
                 auto phast = cpu->getPhast(tid);
-                phast->squashBranches(fromIEW->mispredictInst[tid]->phastDecodeBranchCount);
+                auto mispredicted_branch = fromIEW->mispredictInst[tid];
+                phast->squashBranches(mispredicted_branch->phastDecodeBranchCount);
+
+                // PHAST: Re-record the divergent branch with its correct outcome
+                if (mispredicted_branch->isCondCtrl() || mispredicted_branch->isIndirectCtrl()) {
+                    bool actual_taken = fromIEW->branchTaken[tid];
+                    Addr actual_target = fromIEW->pc[tid]->instAddr();
+                    phast->recordBranch(mispredicted_branch->isIndirectCtrl(), actual_taken, actual_target);
+                }
             } else {
                 DPRINTF(Commit,
                     "[tid:%i] Squashing due to order violation [sn:%llu]\n",
                     tid, fromIEW->squashedSeqNum[tid]);
+
+                // PHAST: Restore branch counter for memory order violation
+                auto phast = cpu->getPhast(tid);
+                auto violator_inst = rob->findInst(tid, fromIEW->squashedSeqNum[tid]);
+                if (violator_inst) {
+                    phast->squashBranches(violator_inst->phastDecodeBranchCount);
+                }
             }
 
             DPRINTF(Commit, "[tid:%i] Redirecting to PC %#x\n",
