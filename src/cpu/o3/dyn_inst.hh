@@ -367,6 +367,7 @@ class DynInst : public ExecContext, public RefCounted
     /** Prediction info for confidence update at commit */
     std::vector<PhastEntry> *predictedEntrySetPtr = nullptr;
     int predictedWayInSet = -1;
+    InstSeqNum predictedStoreSeqNum = 0;
 
 
     /////////////////////// TLB Miss //////////////////////

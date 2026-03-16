@@ -109,22 +109,27 @@ Phast::updateLRU(std::vector<PhastEntry>& set, int accessed_way)
 void
 Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
 {
-    int actual_store_dist = -1;
+    int actual_store_dist = 0;
+    bool found_store = false;
     for (int i = 0; i < recentStores.size(); ++i) {
         if (storeIndex <= i) break;
-        if (storeDistToSeqNum(i) == store_inst->seqNum) {
-            actual_store_dist = i;
+        InstSeqNum sn = storeDistToSeqNum(i);
+        if (sn > load_inst->seqNum) continue;
+        if (sn == store_inst->seqNum) {
+            found_store = true;
             break;
         }
+        actual_store_dist++;
     }
 
-    if (actual_store_dist == -1) return; // Store too old, fallen off recent stores
+    if (!found_store) return; // Store too old, fallen off recent stores
     if (actual_store_dist > 127) actual_store_dist = 127; // Max 7-bit distance
 
     int hist_len = 0;
     if (load_inst->phastDecodeBranchCount > store_inst->phastDecodeBranchCount) {
         hist_len = load_inst->phastDecodeBranchCount - store_inst->phastDecodeBranchCount;
     }
+    hist_len += 1; // N+1 divergent branches as per the PHAST paper
 
     int target_table_idx = tables.size() - 1;
     for (int t = 0; t < tables.size(); ++t) {
@@ -241,7 +246,9 @@ Phast::checkInst(const DynInstPtr &load_inst)
     if (best_store_dist >= 0) {
         load_inst->predictedEntrySetPtr = best_set;
         load_inst->predictedWayInSet = best_way;
-        return storeDistToSeqNum(best_store_dist);
+        InstSeqNum predicted_sn = storeDistToSeqNum(best_store_dist);
+        load_inst->predictedStoreSeqNum = predicted_sn;
+        return predicted_sn;
     } else {
         return 0; // 0 means no dependence
     }
@@ -275,7 +282,7 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
     int w = load_inst->predictedWayInSet;
 
     if (set[w].valid) {
-        InstSeqNum predicted_forwarding_store_seq_num = storeDistToSeqNum(set[w].storeDist);
+        InstSeqNum predicted_forwarding_store_seq_num = load_inst->predictedStoreSeqNum;
         bool is_correct = load_inst->forwardingStoreSeqNum == predicted_forwarding_store_seq_num;
         if (is_correct) {
             set[w].confidence = MAX_CONFIDENCE;
