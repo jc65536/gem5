@@ -276,7 +276,9 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(lqAvgOccupancy, statistics::units::Ratio::get(),
                "Average LQ Occupancy (UsedSlots/TotalSlots)"),
       ADD_STAT(sqAvgOccupancy, statistics::units::Ratio::get(),
-               "Average SQ Occupancy (UsedSlots/TotalSlots)")
+               "Average SQ Occupancy (UsedSlots/TotalSlots)"),
+      ADD_STAT(numFalseOrderViolationsSkipped, statistics::units::Count::get(),
+               "Number of false order violations skipped")
 {
     loadToUse
         .init(0, 299, 10)
@@ -579,6 +581,7 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                 // it should not be squashed by this older executing store.
                 if (ld_inst->forwardingStoreSeqNum != 0 &&
                     ld_inst->forwardingStoreSeqNum > inst->seqNum) {
+                    ++stats.numFalseOrderViolationsSkipped;
                     ++loadIt;
                     continue;
                 }

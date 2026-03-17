@@ -77,6 +77,8 @@ namespace o3
 class CPU;
 class InstructionQueue;
 
+extern bool usePhast;
+
 /**
  * Memory dependency unit class.  This holds the memory dependence predictor.
  * As memory operations are issued to the IQ, they are also issued to this
@@ -239,9 +241,6 @@ class MemDepUnit
 
     /** A list of all instructions that are going to be replayed. */
     std::list<DynInstPtr> instsToReplay;
-
-    /** If the StoreSet predictor should be used instead of Phast. */
-    bool useStoreSet;
 
     /** The Phast memory dependence predictor. */
     Phast phastPred;

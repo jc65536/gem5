@@ -685,9 +685,7 @@ Decode::decodeInsts(ThreadID tid)
         // PHAST: Tracking
         auto phast = cpu->getPhast(tid);
         // PHAST: snapshot global branch count for loads, stores AND control instructions
-        if (inst->isLoad() || inst->isStore() || inst->isAtomic() || inst->isControl()) {
-            inst->phastDecodeBranchCount = phast->getBranchCount();
-        }
+        inst->phastDecodeBranchCount = phast->getBranchCount();
 
         // PHAST: record divergent branches
         if (inst->isControl() && (inst->isCondCtrl() || inst->isIndirectCtrl())) {

@@ -560,6 +560,8 @@ class LSQUnit
         statistics::Average lqAvgOccupancy;
         /** SQ Occupancy */
         statistics::Average sqAvgOccupancy;
+
+        statistics::Scalar numFalseOrderViolationsSkipped;
     } stats;
 
   public:

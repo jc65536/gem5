@@ -46,13 +46,15 @@ namespace gem5
 namespace o3
 {
 
+bool usePhast = false;
+
 #ifdef GEM5_DEBUG
 int MemDepUnit::MemDepEntry::memdep_count = 0;
 int MemDepUnit::MemDepEntry::memdep_insert = 0;
 int MemDepUnit::MemDepEntry::memdep_erase = 0;
 #endif
 
-MemDepUnit::MemDepUnit() : iqPtr(NULL), useStoreSet(false), stats(nullptr) {}
+MemDepUnit::MemDepUnit() : iqPtr(NULL), stats(nullptr) {}
 
 MemDepUnit::MemDepUnit(const BaseO3CPUParams &params)
     : _name(params.name + ".memdepunit"),
@@ -66,9 +68,9 @@ MemDepUnit::MemDepUnit(const BaseO3CPUParams &params)
       stats(nullptr)
 {
     const char *env_val = std::getenv("MEM_DEP_PREDICTOR");
-    useStoreSet = (env_val && std::string(env_val) == "ss");
+    usePhast = !(env_val && std::string(env_val) == "ss");
     DPRINTF(MemDepUnit, "Creating MemDepUnit object. Using %s predictor.\n",
-            useStoreSet ? "StoreSet" : "Phast");
+            usePhast ? "Phast" : "StoreSet");
 }
 
 MemDepUnit::~MemDepUnit()
@@ -112,7 +114,7 @@ MemDepUnit::init(const BaseO3CPUParams &params, ThreadID tid, CPU *cpu)
                  params.SSITIndexingPolicy, params.LFSTSize);
 
     const char *env_val = std::getenv("MEM_DEP_PREDICTOR");
-    useStoreSet = (env_val && std::string(env_val) == "ss");
+    usePhast = !(env_val && std::string(env_val) == "ss");
 
     std::string stats_group_name = csprintf("MemDepUnit__%i", tid);
     cpu->addStatGroup(stats_group_name.c_str(), &stats);
@@ -160,10 +162,10 @@ MemDepUnit::takeOverFrom()
     // Be sure to reset all state.
     loadBarrierSNs.clear();
     storeBarrierSNs.clear();
-    if (useStoreSet) {
-        ssPred.clear();
-    } else {
+    if (usePhast) {
         phastPred.clear();
+    } else {
+        ssPred.clear();
     }
 }
 
@@ -240,10 +242,10 @@ MemDepUnit::insert(const DynInstPtr &inst)
                                 std::end(storeBarrierSNs));
     } else {
         InstSeqNum dep;
-        if (useStoreSet) {
-            dep = ssPred.checkInst(inst->pcState().instAddr());
-        } else {
+        if (usePhast) {
             dep = phastPred.checkInst(inst);
+        } else {
+            dep = ssPred.checkInst(inst->pcState().instAddr());
         }
         if (dep != 0)
             producing_stores.push_back(dep);
@@ -310,11 +312,11 @@ MemDepUnit::insert(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        if (useStoreSet) {
+        if (usePhast) {
+            phastPred.insertStore(inst);
+        } else {
             ssPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
                                inst->threadNumber);
-        } else {
-            phastPred.insertStore(inst);
         }
 
         ++stats.insertedStores;
@@ -336,11 +338,11 @@ MemDepUnit::insertNonSpec(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        if (useStoreSet) {
+        if (usePhast) {
+            phastPred.insertStore(inst);
+        } else {
             ssPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
                                inst->threadNumber);
-        } else {
-            phastPred.insertStore(inst);
         }
 
         ++stats.insertedStores;
@@ -596,10 +598,10 @@ MemDepUnit::squash(const InstSeqNum &squashed_num, ThreadID tid)
     }
 
     // Tell the dependency predictor to squash as well.
-    if (useStoreSet) {
-        ssPred.squash(squashed_num, tid);
-    } else {
+    if (usePhast) {
         phastPred.squash(squashed_num, tid);
+    } else {
+        ssPred.squash(squashed_num, tid);
     }
 }
 
@@ -611,11 +613,11 @@ MemDepUnit::violation(const DynInstPtr &store_inst,
             " load: %#x, store: %#x\n", violating_load->pcState().instAddr(),
             store_inst->pcState().instAddr());
     // Tell the memory dependence unit of the violation.
-    if (useStoreSet) {
+    if (usePhast) {
+        phastPred.violation(store_inst, violating_load);
+    } else {
         ssPred.violation(store_inst->pcState().instAddr(),
                          violating_load->pcState().instAddr());
-    } else {
-        phastPred.violation(store_inst, violating_load);
     }
 }
 
@@ -625,10 +627,10 @@ MemDepUnit::issue(const DynInstPtr &inst)
     DPRINTF(MemDepUnit, "Issuing instruction PC %#x [sn:%lli].\n",
             inst->pcState().instAddr(), inst->seqNum);
 
-    if (useStoreSet) {
-        ssPred.issued(inst->pcState().instAddr(), inst->seqNum, inst->isStore());
-    } else {
+    if (usePhast) {
         phastPred.issued(inst->pcState().instAddr(), inst->seqNum, inst->isStore());
+    } else {
+        ssPred.issued(inst->pcState().instAddr(), inst->seqNum, inst->isStore());
     }
 }
 
