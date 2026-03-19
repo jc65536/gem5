@@ -6,6 +6,7 @@
 #include "base/trace.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "debug/Phast.hh"
+#include "cpu/o3/cpu.hh"
 
 namespace gem5
 {
@@ -18,14 +19,12 @@ Phast::Phast(std::string_view name_, uint64_t clear_period,
              replacement_policy::Base *_replPolicy,
              BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
   : Named(name_),
-    globalDivergentBranchCounter(0),
+    ghbCounter(0),
     globalHistoryBuffer(512, 0),
-    recentStores(1024, 0),
-    storeIndex(0),
     clearPeriod(clear_period),
-    memOpsPred(0)
+    memOpsPred(0),
+    stats(nullptr)
 {
-    DPRINTF(Phast, "Phast: Creating PHAST object.\n");
     for (int len : HISTORY_LENGTHS) {
         tables.emplace_back(len);
     }
@@ -36,21 +35,24 @@ Phast::~Phast()
 }
 
 void
-Phast::init(uint64_t clear_period, size_t _SSIT_entries,
+Phast::init(CPU *cpu_ptr, ThreadID tid, uint64_t clear_period, size_t _SSIT_entries,
             int _SSIT_assoc, replacement_policy::Base *_replPolicy,
             BaseIndexingPolicy *_indexingPolicy, int _LFST_size)
 {
     clearPeriod = clear_period;
     memOpsPred = 0;
-    globalDivergentBranchCounter = 0;
+    ghbCounter = 0;
+    ghbSize = 0;
     globalHistoryBuffer.assign(512, 0);
-    recentStores.assign(1024, 0);
-    storeIndex = 0;
+
+    cpu_ptr->addStatGroup(csprintf("phast%i", tid).c_str(), &stats);
     
     tables.clear();
     for (int len : HISTORY_LENGTHS) {
         tables.emplace_back(len);
     }
+
+    DPRINTF(Phast, "init: clearPeriod = %d\n", clearPeriod);
 }
 
 void
@@ -62,8 +64,15 @@ Phast::recordBranch(bool is_indirect, bool is_taken, Addr target)
     uint8_t target_bits = (target >> 2) & 0x1F;
     hist_entry |= target_bits;
 
-    globalHistoryBuffer[globalDivergentBranchCounter % 512] = hist_entry;
-    globalDivergentBranchCounter++;
+    globalHistoryBuffer[ghbCounter % 512] = hist_entry;
+    ghbCounter++;
+    ghbSize = std::min(ghbSize + 1, 512);
+}
+
+void Phast::squashBranches(uint64_t recovered_count) {
+    ghbSize = std::max(ghbSize - int(ghbCounter - recovered_count), 0);
+    DPRINTF(Phast, "squashBranches: ghbCounter = %d, recovered_count = %d, ghbSize after = %d\n", ghbCounter, recovered_count, ghbSize);
+    ghbCounter = recovered_count;
 }
 
 uint32_t
@@ -73,6 +82,7 @@ Phast::foldHistory(uint64_t load_branch_count, int hist_len) const
     for (int i = 0; i < hist_len; ++i) {
         if (load_branch_count <= i) break;
         uint64_t idx = load_branch_count - 1 - i;
+        if (idx < ghbCounter - ghbSize) break;
         uint8_t branch_hist = globalHistoryBuffer[idx % 512];
         folded = (folded << 3) | (folded >> 20); // Rotate left by 3
         folded ^= branch_hist;
@@ -110,19 +120,12 @@ void
 Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
 {
     int actual_store_dist = 0;
-    bool found_store = false;
-    for (int i = 0; i < recentStores.size(); ++i) {
-        if (storeIndex <= i) break;
-        InstSeqNum sn = storeDistToSeqNum(i);
-        if (sn > load_inst->seqNum) continue;
-        if (sn == store_inst->seqNum) {
-            found_store = true;
-            break;
-        }
-        actual_store_dist++;
-    }
+    actual_store_dist = load_inst->sqIdx - store_inst->sqIdx;
 
-    if (!found_store) return; // Store too old, fallen off recent stores
+    DPRINTF(Phast, "violation: store_inst sqIdx: %d\n", store_inst->sqIdx);
+    DPRINTF(Phast, "violation: load_inst sqIdx: %d\n", load_inst->sqIdx);
+    DPRINTF(Phast, "violation: Found actual store dist %d\n", actual_store_dist);
+
     if (actual_store_dist > 127) actual_store_dist = 127; // Max 7-bit distance
 
     int hist_len = 0;
@@ -130,6 +133,9 @@ Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
         hist_len = load_inst->phastDecodeBranchCount - store_inst->phastDecodeBranchCount;
     }
     hist_len += 1; // N+1 divergent branches as per the PHAST paper
+    DPRINTF(Phast, "violation: store_inst phastDecodeBranchCount %d\n", store_inst->phastDecodeBranchCount);
+    DPRINTF(Phast, "violation: load_inst phastDecodeBranchCount %d\n", load_inst->phastDecodeBranchCount);
+    DPRINTF(Phast, "violation: hist_len %d\n", hist_len);
 
     int target_table_idx = tables.size() - 1;
     for (int t = 0; t < tables.size(); ++t) {
@@ -205,8 +211,6 @@ void
 Phast::insertStore(const DynInstPtr &store_inst)
 {
     checkClear();
-    recentStores[storeIndex % recentStores.size()] = store_inst->seqNum;
-    storeIndex++;
 }
 
 InstSeqNum
@@ -243,13 +247,30 @@ Phast::checkInst(const DynInstPtr &load_inst)
         }
     }
 
+    InstSeqNum predicted_sn = 0;
+
     if (best_store_dist >= 0) {
+        predicted_sn = storeDistToSeqNum(load_inst, best_store_dist);
+    }
+
+    if (predicted_sn) {
+        DPRINTF(Phast, "checkInst: [%d] best_store_dist = %d, best_hist_len = %d, predicted_sn = %d\n",
+            load_inst->seqNum,
+            best_store_dist,
+            best_hist_len,
+            predicted_sn);
+
         load_inst->predictedEntrySetPtr = best_set;
         load_inst->predictedWayInSet = best_way;
-        InstSeqNum predicted_sn = storeDistToSeqNum(best_store_dist);
         load_inst->predictedStoreSeqNum = predicted_sn;
+        load_inst->predictedStoreDist = best_store_dist;
         return predicted_sn;
     } else {
+        load_inst->predictedEntrySetPtr = nullptr;
+        load_inst->predictedWayInSet = -1;
+        load_inst->predictedStoreSeqNum = 0;
+        load_inst->predictedStoreDist = -1;
+        DPRINTF(Phast, "checkInst: [%d] no dependence, best_store_dist = %d, best_hist_len = %d\n", load_inst->seqNum, best_store_dist, best_hist_len);
         return 0; // 0 means no dependence
     }
 }
@@ -262,13 +283,6 @@ Phast::issued(Addr issued_PC, InstSeqNum issued_seq_num, bool is_store)
 void
 Phast::squash(InstSeqNum squashed_num, ThreadID tid)
 {
-    while (storeIndex > 0) {
-        if (storeDistToSeqNum(0) > squashed_num) {
-            storeIndex--;
-        } else {
-            break;
-        }
-    }
 }
 
 void
@@ -286,10 +300,25 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
         bool is_correct = load_inst->forwardingStoreSeqNum == predicted_forwarding_store_seq_num;
         if (is_correct) {
             set[w].confidence = MAX_CONFIDENCE;
+            stats.numCorrectPredictions++;
+            if (load_inst->predictedStoreSeqNum) {
+                DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            } else {
+                DPRINTF(Phast, "updateConfidence: [%d] TN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            }
         } else if (set[w].confidence > 0) {
             set[w].confidence--;
+            stats.numIncorrectPredictions++;
+            if (load_inst->predictedStoreSeqNum) {
+                DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            } else {
+                DPRINTF(Phast, "updateConfidence: [%d] FN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            }
         }
         updateLRU(set, w);
+    } else {
+        stats.numPredictionsNotFound++;
+        DPRINTF(Phast, "updateConfidence: [%d] committed prediction not found\n", load_inst->seqNum);
     }
 }
 
@@ -312,8 +341,27 @@ Phast::dump()
 {
 }
 
-InstSeqNum Phast::storeDistToSeqNum(int store_dist) const {
-    return recentStores[(storeIndex - 1 - store_dist) % recentStores.size()];
+InstSeqNum Phast::storeDistToSeqNum(const DynInstPtr &load_inst, int store_dist) const {
+    auto sqIt = load_inst->sqIt;
+    sqIt._idx -= store_dist;
+    if (sqIt.dereferenceable()) {
+        DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d before sqIdx = %d is valid\n", store_dist, load_inst->sqIdx);
+        return sqIt->instruction()->seqNum;
+    } else {
+        DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d before sqIdx = %d is invalid\n", store_dist, load_inst->sqIdx);
+        return 0;
+    }
+}
+
+Phast::PhastStats::PhastStats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(numCorrectPredictions, statistics::units::Count::get(),
+               "Number of predictions that were correct"),
+      ADD_STAT(numIncorrectPredictions, statistics::units::Count::get(),
+               "Number of predictions that were incorrect"),
+      ADD_STAT(numPredictionsNotFound, statistics::units::Count::get(),
+               "Number of predictions that were not found")
+{
 }
 
 } // namespace o3

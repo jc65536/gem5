@@ -368,6 +368,7 @@ class DynInst : public ExecContext, public RefCounted
     std::vector<PhastEntry> *predictedEntrySetPtr = nullptr;
     int predictedWayInSet = -1;
     InstSeqNum predictedStoreSeqNum = 0;
+    int predictedStoreDist = -1;
 
 
     /////////////////////// TLB Miss //////////////////////

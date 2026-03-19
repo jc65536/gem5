@@ -68,7 +68,7 @@ MemDepUnit::MemDepUnit(const BaseO3CPUParams &params)
       stats(nullptr)
 {
     const char *env_val = std::getenv("MEM_DEP_PREDICTOR");
-    usePhast = !(env_val && std::string(env_val) == "ss");
+    usePhast = (env_val && std::string(env_val) == "phast");
     DPRINTF(MemDepUnit, "Creating MemDepUnit object. Using %s predictor.\n",
             usePhast ? "Phast" : "StoreSet");
 }
@@ -106,7 +106,7 @@ MemDepUnit::init(const BaseO3CPUParams &params, ThreadID tid, CPU *cpu)
 
     id = tid;
 
-    phastPred.init(params.store_set_clear_period,
+    phastPred.init(cpu, tid, params.store_set_clear_period,
                  params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
                  params.SSITIndexingPolicy, params.LFSTSize);
     ssPred.init(params.store_set_clear_period,

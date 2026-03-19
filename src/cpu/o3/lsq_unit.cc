@@ -60,6 +60,8 @@ namespace gem5
 namespace o3
 {
 
+extern bool usePhast;
+
 LSQUnit::WritebackEvent::WritebackEvent(const DynInstPtr &_inst,
         PacketPtr _pkt, LSQUnit *lsq_ptr)
     : Event(Default_Pri, AutoDelete),
@@ -340,6 +342,7 @@ LSQUnit::insertLoad(const DynInstPtr &load_inst)
     /* Grow the queue. */
     loadQueue.advance_tail();
 
+    load_inst->sqIdx = storeQueue.tail() + 1;
     load_inst->sqIt = storeQueue.end();
 
     assert(!loadQueue.back().valid());
@@ -579,8 +582,7 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                 // PHAST: Filtering squashes on store-to-load forwarding.
                 // If the load received data from a younger store (which is still older than the load),
                 // it should not be squashed by this older executing store.
-                if (ld_inst->forwardingStoreSeqNum != 0 &&
-                    ld_inst->forwardingStoreSeqNum > inst->seqNum) {
+                if (usePhast && ld_inst->forwardingStoreSeqNum > inst->seqNum) {
                     ++stats.numFalseOrderViolationsSkipped;
                     ++loadIt;
                     continue;

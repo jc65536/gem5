@@ -308,6 +308,8 @@ class LSQUnit
     /** Returns the number of stores in the SQ. */
     int numStores() { return storeQueue.size(); }
 
+    StoreQueue &getStoreQueue() { return storeQueue; }
+
     /** Returns the current occupancy of the passed
      * queue (store queue or load queue) */
     template <typename Queue>

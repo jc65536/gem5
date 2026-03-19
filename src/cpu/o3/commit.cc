@@ -813,7 +813,7 @@ Commit::commit()
 
                 // PHAST: Restore branch counter for memory order violation
                 auto phast = cpu->getPhast(tid);
-                auto violator_inst = rob->findInst(tid, fromIEW->squashedSeqNum[tid]);
+                auto violator_inst = rob->findInst(tid, fromIEW->squashedSeqNum[tid] - fromIEW->includeSquashInst[tid]);
                 if (violator_inst) {
                     phast->squashBranches(violator_inst->phastDecodeBranchCount);
                 }
