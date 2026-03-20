@@ -691,7 +691,7 @@ Decode::decodeInsts(ThreadID tid)
         if (inst->isControl() && (inst->isCondCtrl() || inst->isIndirectCtrl())) {
             bool taken = inst->readPredTaken();
             Addr target = inst->readPredTarg().instAddr();
-            phast->recordBranch(inst->isIndirectCtrl(), taken, target);
+            phast->recordBranch(inst->isIndirectCtrl(), taken, target, inst->seqNum);
         }
 
         // Also check if instructions have no source registers.  Mark

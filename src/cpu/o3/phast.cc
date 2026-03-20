@@ -21,6 +21,7 @@ Phast::Phast(std::string_view name_, uint64_t clear_period,
   : Named(name_),
     ghbCounter(0),
     globalHistoryBuffer(512, 0),
+    ghbSeqNum(512, 0),
     clearPeriod(clear_period),
     memOpsPred(0),
     stats(nullptr)
@@ -44,6 +45,7 @@ Phast::init(CPU *cpu_ptr, ThreadID tid, uint64_t clear_period, size_t _SSIT_entr
     ghbCounter = 0;
     ghbSize = 0;
     globalHistoryBuffer.assign(512, 0);
+    ghbSeqNum.assign(512, 0);
 
     cpu_ptr->addStatGroup(csprintf("phast%i", tid).c_str(), &stats);
     
@@ -56,7 +58,7 @@ Phast::init(CPU *cpu_ptr, ThreadID tid, uint64_t clear_period, size_t _SSIT_entr
 }
 
 void
-Phast::recordBranch(bool is_indirect, bool is_taken, Addr target)
+Phast::recordBranch(bool is_indirect, bool is_taken, Addr target, InstSeqNum sn)
 {
     uint8_t hist_entry = 0;
     if (is_indirect) hist_entry |= (1 << 6);
@@ -65,6 +67,7 @@ Phast::recordBranch(bool is_indirect, bool is_taken, Addr target)
     hist_entry |= target_bits;
 
     globalHistoryBuffer[ghbCounter % 512] = hist_entry;
+    ghbSeqNum[ghbCounter % 512] = sn;
     ghbCounter++;
     ghbSize = std::min(ghbSize + 1, 512);
 }
@@ -78,6 +81,7 @@ void Phast::squashBranches(uint64_t recovered_count) {
 uint32_t
 Phast::foldHistory(uint64_t load_branch_count, int hist_len) const
 {
+    hist_len += 1;
     uint32_t folded = 0;
     for (int i = 0; i < hist_len; ++i) {
         if (load_branch_count <= i) break;
@@ -132,7 +136,6 @@ Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
     if (load_inst->phastDecodeBranchCount > store_inst->phastDecodeBranchCount) {
         hist_len = load_inst->phastDecodeBranchCount - store_inst->phastDecodeBranchCount;
     }
-    hist_len += 1; // N+1 divergent branches as per the PHAST paper
     DPRINTF(Phast, "violation: store_inst phastDecodeBranchCount %d\n", store_inst->phastDecodeBranchCount);
     DPRINTF(Phast, "violation: load_inst phastDecodeBranchCount %d\n", load_inst->phastDecodeBranchCount);
     DPRINTF(Phast, "violation: hist_len %d\n", hist_len);
@@ -218,6 +221,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
 {
     int best_store_dist = -1;
     int best_hist_len = -1;
+    uint16_t best_tag = 0;
     std::vector<PhastEntry> *best_set = nullptr;
     int best_way = -1;
     Addr pc = load_inst->pcState().instAddr();
@@ -240,6 +244,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
                     best_store_dist = set[w].storeDist;
                     best_set = &set;
                     best_way = w;
+                    best_tag = tag;
                 }
                 updateLRU(set, w); 
                 break;
@@ -254,7 +259,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
     }
 
     if (predicted_sn) {
-        DPRINTF(Phast, "checkInst: [%d] best_store_dist = %d, best_hist_len = %d, predicted_sn = %d\n",
+        DPRINTF(Phast, "checkInst: [%d] yes dependence, best_store_dist = %d, best_hist_len = %d, predicted_sn = %d\n",
             load_inst->seqNum,
             best_store_dist,
             best_hist_len,
@@ -262,6 +267,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
 
         load_inst->predictedEntrySetPtr = best_set;
         load_inst->predictedWayInSet = best_way;
+        load_inst->predictedTag = best_tag;
         load_inst->predictedStoreSeqNum = predicted_sn;
         load_inst->predictedStoreDist = best_store_dist;
         return predicted_sn;
@@ -270,6 +276,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
         load_inst->predictedWayInSet = -1;
         load_inst->predictedStoreSeqNum = 0;
         load_inst->predictedStoreDist = -1;
+        load_inst->predictedTag = 0;
         DPRINTF(Phast, "checkInst: [%d] no dependence, best_store_dist = %d, best_hist_len = %d\n", load_inst->seqNum, best_store_dist, best_hist_len);
         return 0; // 0 means no dependence
     }
@@ -283,37 +290,51 @@ Phast::issued(Addr issued_PC, InstSeqNum issued_seq_num, bool is_store)
 void
 Phast::squash(InstSeqNum squashed_num, ThreadID tid)
 {
+    int squash_amt = 0;
+    for (; squash_amt < ghbSize; squash_amt++) {
+        if (ghbSeqNum[ghbCounter - squash_amt - 1] <= squashed_num) {
+            if (squash_amt > 0) {
+                squash_amt--;
+            }
+            break;
+        }
+    }
+
+    if (squash_amt > 0) {
+        squashBranches(ghbCounter - squash_amt);
+    }
 }
 
 void
 Phast::updateConfidence(const DynInstPtr &load_inst)
 {
-    if (!load_inst->predictedEntrySetPtr || load_inst->predictedWayInSet < 0) {
+    if (!load_inst->predictedEntrySetPtr || load_inst->predictedWayInSet < 0 || load_inst->predictedStoreSeqNum == 0) {
+        // No dependence predicted
+        bool is_correct = load_inst->forwardingStoreSeqNum == load_inst->predictedStoreSeqNum;
+        if (is_correct) {
+            DPRINTF(Phast, "updateConfidence: [%d] TN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            stats.numCorrectPredictions++;
+        } else {
+            DPRINTF(Phast, "updateConfidence: [%d] FN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            stats.numIncorrectPredictions++;
+        }
         return;
     }
 
     std::vector<PhastEntry> &set = *(load_inst->predictedEntrySetPtr);
     int w = load_inst->predictedWayInSet;
 
-    if (set[w].valid) {
+    if (set[w].valid && set[w].tag == load_inst->predictedTag) {
         InstSeqNum predicted_forwarding_store_seq_num = load_inst->predictedStoreSeqNum;
         bool is_correct = load_inst->forwardingStoreSeqNum == predicted_forwarding_store_seq_num;
         if (is_correct) {
             set[w].confidence = MAX_CONFIDENCE;
             stats.numCorrectPredictions++;
-            if (load_inst->predictedStoreSeqNum) {
-                DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-            } else {
-                DPRINTF(Phast, "updateConfidence: [%d] TN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-            }
+            DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
         } else if (set[w].confidence > 0) {
             set[w].confidence--;
             stats.numIncorrectPredictions++;
-            if (load_inst->predictedStoreSeqNum) {
-                DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-            } else {
-                DPRINTF(Phast, "updateConfidence: [%d] FN prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-            }
+            DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
         }
         updateLRU(set, w);
     } else {

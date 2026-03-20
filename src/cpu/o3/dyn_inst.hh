@@ -369,6 +369,7 @@ class DynInst : public ExecContext, public RefCounted
     int predictedWayInSet = -1;
     InstSeqNum predictedStoreSeqNum = 0;
     int predictedStoreDist = -1;
+    uint16_t predictedTag = 0;
 
 
     /////////////////////// TLB Miss //////////////////////

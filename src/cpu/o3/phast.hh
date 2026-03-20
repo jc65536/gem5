@@ -146,7 +146,7 @@ class Phast : public Named
     void dump();
 
     /** PHAST specific: Records a branch into history. */
-    void recordBranch(bool is_indirect, bool is_taken, Addr target);
+    void recordBranch(bool is_indirect, bool is_taken, Addr target, InstSeqNum sn);
     
     /** PHAST specific: Gets current branch count. */
     uint64_t getBranchCount() const { return ghbCounter; }
@@ -165,6 +165,7 @@ class Phast : public Named
     uint64_t ghbCounter;
     int ghbSize;
     std::vector<uint8_t> globalHistoryBuffer;
+    std::vector<InstSeqNum> ghbSeqNum;
 
     InstSeqNum storeDistToSeqNum(const DynInstPtr &load_inst, int store_dist) const;
 

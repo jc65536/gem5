@@ -804,7 +804,7 @@ Commit::commit()
                 if (mispredicted_branch->isCondCtrl() || mispredicted_branch->isIndirectCtrl()) {
                     bool actual_taken = fromIEW->branchTaken[tid];
                     Addr actual_target = fromIEW->pc[tid]->instAddr();
-                    phast->recordBranch(mispredicted_branch->isIndirectCtrl(), actual_taken, actual_target);
+                    phast->recordBranch(mispredicted_branch->isIndirectCtrl(), actual_taken, actual_target, mispredicted_branch->seqNum);
                 }
             } else {
                 DPRINTF(Commit,
