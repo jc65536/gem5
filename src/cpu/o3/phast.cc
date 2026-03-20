@@ -152,7 +152,9 @@ Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
     if (hist_len > load_inst->phastDecodeBranchCount) return;
 
     Addr pc = load_inst->pcState().instAddr();
-    uint32_t folded = foldHistory(load_inst->phastDecodeBranchCount, hist_len);
+    // Use cached folded history from decode time instead of re-reading
+    // from the GHB, which may have been overwritten by now.
+    uint32_t folded = load_inst->phastFoldedHistory[target_table_idx];
     int index;
     uint16_t tag;
     getIndexAndTag(pc, folded, index, tag);
@@ -236,6 +238,7 @@ Phast::checkInst(const DynInstPtr &load_inst)
         if (hist_len > load_branch_count) continue; 
 
         uint32_t folded = foldHistory(load_branch_count, hist_len);
+        load_inst->phastFoldedHistory[t] = folded;  // Cache for training
         int index;
         uint16_t tag;
         getIndexAndTag(pc, folded, index, tag);

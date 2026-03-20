@@ -374,6 +374,10 @@ class DynInst : public ExecContext, public RefCounted
     /** Store that caused a memory order violation with this load (for lazy training at commit) */
     DynInstPtr phastViolationStore = nullptr;
 
+    /** Folded history cached at decode time, one per PHAST table.
+     *  Used for both prediction and training to ensure hash consistency. */
+    uint32_t phastFoldedHistory[8] = {};
+
     /////////////////////// TLB Miss //////////////////////
     /**
      * Saved memory request (needed when the DTB address translation is
