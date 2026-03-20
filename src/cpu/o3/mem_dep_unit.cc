@@ -262,6 +262,8 @@ MemDepUnit::insert(const DynInstPtr &inst)
         if (hash_it != memDepHash.end()) {
             store_entries.push_back((*hash_it).second);
             DPRINTF(MemDepUnit, "Producer found\n");
+        } else if (usePhast && producing_store != 0) {
+            phastPred.stats.checkInstProducerNotInHash++;
         }
     }
 

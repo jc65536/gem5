@@ -123,6 +123,7 @@ Phast::updateLRU(std::vector<PhastEntry>& set, int accessed_way)
 void
 Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
 {
+    ++stats.violationCalls;
     int actual_store_dist = 0;
     actual_store_dist = load_inst->sqIdx - store_inst->sqIdx;
 
@@ -225,6 +226,8 @@ Phast::checkInst(const DynInstPtr &load_inst)
         return 0;
     }
 
+    ++stats.checkInstCalls;
+
     int best_store_dist = -1;
     int best_hist_len = -1;
     uint16_t best_tag = 0;
@@ -233,9 +236,11 @@ Phast::checkInst(const DynInstPtr &load_inst)
     Addr pc = load_inst->pcState().instAddr();
     uint64_t load_branch_count = load_inst->phastDecodeBranchCount;
 
+    bool found_confidence_zero = false;
+
     for (int t = 0; t < tables.size(); ++t) {
         int hist_len = tables[t].historyLength;
-        if (hist_len > load_branch_count) continue; 
+        if (hist_len > load_branch_count) continue;
 
         uint32_t folded = foldHistory(load_branch_count, hist_len);
         load_inst->phastFoldedHistory[t] = folded;  // Cache for training
@@ -245,24 +250,39 @@ Phast::checkInst(const DynInstPtr &load_inst)
 
         auto& set = tables[t].sets[index];
         for (int w = 0; w < NUM_WAYS; ++w) {
-            if (set[w].valid && set[w].tag == tag && set[w].confidence > 0) {
-                if (hist_len > best_hist_len) {
-                    best_hist_len = hist_len;
-                    best_store_dist = set[w].storeDist;
-                    best_set = &set;
-                    best_way = w;
-                    best_tag = tag;
+            if (set[w].valid && set[w].tag == tag) {
+                if (set[w].confidence > 0) {
+                    if (hist_len > best_hist_len) {
+                        best_hist_len = hist_len;
+                        best_store_dist = set[w].storeDist;
+                        best_set = &set;
+                        best_way = w;
+                        best_tag = tag;
+                    }
+                    updateLRU(set, w);
+                } else {
+                    found_confidence_zero = true;
                 }
-                updateLRU(set, w); 
                 break;
             }
         }
+    }
+
+    if (found_confidence_zero && best_store_dist < 0) {
+        ++stats.checkInstConfidenceZero;
     }
 
     InstSeqNum predicted_sn = 0;
 
     if (best_store_dist >= 0) {
         predicted_sn = storeDistToSeqNum(load_inst, best_store_dist);
+        if (predicted_sn) {
+            ++stats.checkInstEntryFound;
+        } else {
+            ++stats.checkInstStoreDistInvalid;
+        }
+    } else {
+        ++stats.checkInstNoEntry;
     }
 
     if (predicted_sn) {
@@ -350,6 +370,7 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
 void
 Phast::clear()
 {
+    ++stats.violationClears;
     for (auto& table : tables) {
         for (auto& set : table.sets) {
             for (auto& entry : set) {
@@ -386,7 +407,23 @@ Phast::PhastStats::PhastStats(statistics::Group *parent)
       ADD_STAT(numIncorrectPredictions, statistics::units::Count::get(),
                "Number of predictions that were incorrect"),
       ADD_STAT(numPredictionsNotFound, statistics::units::Count::get(),
-               "Number of predictions that were not found")
+               "Number of predictions that were not found"),
+      ADD_STAT(checkInstCalls, statistics::units::Count::get(),
+               "Number of checkInst calls for loads"),
+      ADD_STAT(checkInstNoEntry, statistics::units::Count::get(),
+               "checkInst: no matching entry in any table"),
+      ADD_STAT(checkInstEntryFound, statistics::units::Count::get(),
+               "checkInst: entry found with confidence > 0"),
+      ADD_STAT(checkInstStoreDistInvalid, statistics::units::Count::get(),
+               "checkInst: entry found but storeDistToSeqNum returned 0"),
+      ADD_STAT(checkInstProducerNotInHash, statistics::units::Count::get(),
+               "checkInst: valid seqNum but producer not in memDepHash"),
+      ADD_STAT(checkInstConfidenceZero, statistics::units::Count::get(),
+               "checkInst: entry found but confidence was 0"),
+      ADD_STAT(violationCalls, statistics::units::Count::get(),
+               "Number of violation() training calls"),
+      ADD_STAT(violationClears, statistics::units::Count::get(),
+               "Number of times the predictor was cleared")
 {
 }
 

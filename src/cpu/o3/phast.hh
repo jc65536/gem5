@@ -113,6 +113,18 @@ class Phast : public Named
         statistics::Scalar numCorrectPredictions;
         statistics::Scalar numIncorrectPredictions;
         statistics::Scalar numPredictionsNotFound;
+
+        // Diagnostic stats for checkInst
+        statistics::Scalar checkInstCalls;
+        statistics::Scalar checkInstNoEntry;
+        statistics::Scalar checkInstEntryFound;
+        statistics::Scalar checkInstStoreDistInvalid;
+        statistics::Scalar checkInstProducerNotInHash;
+        statistics::Scalar checkInstConfidenceZero;
+
+        // Diagnostic stats for violation training
+        statistics::Scalar violationCalls;
+        statistics::Scalar violationClears;
     } stats;
 
     /** Records a memory ordering violation. */
