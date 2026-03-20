@@ -33,6 +33,9 @@ int main(){
         A[(idx+1)&(SIZE-1)]=i+1;
         A[(idx+2)&(SIZE-1)]=i+2;
         A[(idx+3)&(SIZE-1)]=i+3;
+        A[(idx+4)&(SIZE-1)]=i+4;
+        A[(idx+5)&(SIZE-1)]=i+5;
+        A[(idx+6)&(SIZE-1)]=i+6;
 
         int x=A[idx];
 
