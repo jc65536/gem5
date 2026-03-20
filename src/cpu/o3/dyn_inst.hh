@@ -371,6 +371,8 @@ class DynInst : public ExecContext, public RefCounted
     int predictedStoreDist = -1;
     uint16_t predictedTag = 0;
 
+    /** Store that caused a memory order violation with this load (for lazy training at commit) */
+    DynInstPtr phastViolationStore = nullptr;
 
     /////////////////////// TLB Miss //////////////////////
     /**

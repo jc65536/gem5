@@ -816,6 +816,13 @@ Commit::commit()
                 auto violator_inst = rob->findInst(tid, fromIEW->squashedSeqNum[tid] - fromIEW->includeSquashInst[tid]);
                 if (violator_inst) {
                     phast->squashBranches(violator_inst->phastDecodeBranchCount);
+
+                    // PHAST: Lazy training -- train predictor at commit time
+                    // instead of at detection time (paper Section IV-A1).
+                    if (usePhast && violator_inst->phastViolationStore) {
+                        phast->violation(violator_inst->phastViolationStore,
+                                         violator_inst);
+                    }
                 }
             }
 

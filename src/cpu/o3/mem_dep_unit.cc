@@ -614,7 +614,8 @@ MemDepUnit::violation(const DynInstPtr &store_inst,
             store_inst->pcState().instAddr());
     // Tell the memory dependence unit of the violation.
     if (usePhast) {
-        phastPred.violation(store_inst, violating_load);
+        // PHAST: Training deferred to commit time (lazy training).
+        // Violation data is stamped on the load DynInst in IEW.
     } else {
         ssPred.violation(store_inst->pcState().instAddr(),
                          violating_load->pcState().instAddr());
