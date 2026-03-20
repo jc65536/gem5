@@ -264,6 +264,11 @@ MemDepUnit::insert(const DynInstPtr &inst)
             DPRINTF(MemDepUnit, "Producer found\n");
         } else if (usePhast && producing_store != 0) {
             phastPred.stats.checkInstProducerNotInHash++;
+            DPRINTF(MemDepUnit, "PHAST: Producer [sn:%lli] not in hash! "
+                    "Load [sn:%lli] PC:%#x storeDist:%d sqIdx:%d\n",
+                    producing_store, inst->seqNum,
+                    inst->pcState().instAddr(),
+                    inst->predictedStoreDist, inst->sqIdx);
         }
     }
 

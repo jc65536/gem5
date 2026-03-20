@@ -392,8 +392,13 @@ InstSeqNum Phast::storeDistToSeqNum(const DynInstPtr &load_inst, int store_dist)
     auto sqIt = load_inst->sqIt;
     sqIt._idx -= store_dist;
     if (sqIt.dereferenceable()) {
-        DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d before sqIdx = %d is valid\n", store_dist, load_inst->sqIdx);
-        return sqIt->instruction()->seqNum;
+        auto store_inst = sqIt->instruction();
+        DPRINTF(Phast, "storeDistToSeqNum: load [sn:%d] store_dist=%d "
+                "→ store [sn:%d] PC:%#x sqIdx=%d (load sqIdx=%d)\n",
+                load_inst->seqNum, store_dist,
+                store_inst->seqNum, store_inst->pcState().instAddr(),
+                store_inst->sqIdx, load_inst->sqIdx);
+        return store_inst->seqNum;
     } else {
         DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d before sqIdx = %d is invalid\n", store_dist, load_inst->sqIdx);
         return 0;
