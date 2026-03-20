@@ -596,6 +596,7 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                     if (!ld_inst->phastViolationStore ||
                         inst->seqNum > ld_inst->phastViolationStore->seqNum) {
                         ld_inst->phastViolationStore = inst;
+                        ++stats.memOrderViolation;
                     }
                     ++loadIt;
                     continue;
