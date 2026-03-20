@@ -1,3 +1,3 @@
 #!/bin/bash
 
-DEBUGFLAGS=Phast make "$1" 2>/dev/null | grep -E "$2"
+DEBUGFLAGS="Phast$3" make "$1" 2>/dev/null | grep -E "$2"
