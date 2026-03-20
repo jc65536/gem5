@@ -219,6 +219,10 @@ Phast::insertStore(const DynInstPtr &store_inst)
 InstSeqNum
 Phast::checkInst(const DynInstPtr &load_inst)
 {
+    if (!load_inst->isLoad()) {
+        return 0;
+    }
+
     int best_store_dist = -1;
     int best_hist_len = -1;
     uint16_t best_tag = 0;
@@ -293,9 +297,6 @@ Phast::squash(InstSeqNum squashed_num, ThreadID tid)
     int squash_amt = 0;
     for (; squash_amt < ghbSize; squash_amt++) {
         if (ghbSeqNum[ghbCounter - squash_amt - 1] <= squashed_num) {
-            if (squash_amt > 0) {
-                squash_amt--;
-            }
             break;
         }
     }
@@ -355,6 +356,7 @@ Phast::clear()
         }
     }
     memOpsPred = 0;
+    ghbSize = 0;
 }
 
 void
