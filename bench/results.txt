@@ -1,0 +1,299 @@
+Benchmark: b01_immdep
+phast     ipc                 0.809062
+phast     insertedLoads       226830
+phast     insertedStores      93588
+phast     conflictingLoads    127651
+phast     conflictingStores   53
+phast     squashedLoads       67957
+phast     memOrderViolation   9660
+phast     loadConflictRatio   0.562760657761319
+phast     storeConflictRatio  0.0005663119203316665
+ss        ipc                 0.834815
+ss        insertedLoads       172279
+ss        insertedStores      72186
+ss        conflictingLoads    105340
+ss        conflictingStores   43091
+ss        squashedLoads       13406
+ss        memOrderViolation   86
+ss        loadConflictRatio   0.611450031634732
+ss        storeConflictRatio  0.5969440057628903
+
+Benchmark: b02_longstdist
+phast     ipc                 1.449107
+phast     insertedLoads       296479
+phast     insertedStores      114800
+phast     conflictingLoads    174425
+phast     conflictingStores   54
+phast     squashedLoads       47604
+phast     memOrderViolation   2288
+phast     loadConflictRatio   0.5883216011926645
+phast     storeConflictRatio  0.00047038327526132404
+ss        ipc                 1.463254
+ss        insertedLoads       262236
+ss        insertedStores      101856
+ss        conflictingLoads    175224
+ss        conflictingStores   23003
+ss        squashedLoads       13361
+ss        memOrderViolation   89
+ss        loadConflictRatio   0.6681920102503088
+ss        storeConflictRatio  0.22583843857995603
+
+Benchmark: b03_loopdep
+phast     ipc                 0.81797
+phast     insertedLoads       146977
+phast     insertedStores      74072
+phast     conflictingLoads    101528
+phast     conflictingStores   51
+phast     squashedLoads       42482
+phast     memOrderViolation   7950
+phast     loadConflictRatio   0.6907747470692693
+phast     storeConflictRatio  0.0006885192785397991
+ss        ipc                 0.865734
+ss        insertedLoads       117564
+ss        insertedStores      59537
+ss        conflictingLoads    82273
+ss        conflictingStores   42056
+ss        squashedLoads       13069
+ss        memOrderViolation   78
+ss        loadConflictRatio   0.6998145690857746
+ss        storeConflictRatio  0.7063842652468213
+
+Benchmark: b04_altprod
+phast     ipc                 0.98505
+phast     insertedLoads       151645
+phast     insertedStores      83707
+phast     conflictingLoads    95372
+phast     conflictingStores   51
+phast     squashedLoads       37170
+phast     memOrderViolation   4504
+phast     loadConflictRatio   0.628916218800488
+phast     storeConflictRatio  0.000609268042099227
+ss        ipc                 1.065207
+ss        insertedLoads       127628
+ss        insertedStores      69559
+ss        conflictingLoads    82304
+ss        conflictingStores   27073
+ss        squashedLoads       13153
+ss        memOrderViolation   81
+ss        loadConflictRatio   0.6448741655436111
+ss        storeConflictRatio  0.38920916056872584
+
+Benchmark: b05_sparsedep
+phast     ipc                 0.801634
+phast     insertedLoads       179927
+phast     insertedStores      76984
+phast     conflictingLoads    99858
+phast     conflictingStores   51
+phast     squashedLoads       50297
+phast     memOrderViolation   7963
+phast     loadConflictRatio   0.5549917466528091
+phast     storeConflictRatio  0.0006624753195469188
+ss        ipc                 0.822761
+ss        insertedLoads       145890
+ss        insertedStores      63403
+ss        conflictingLoads    87420
+ss        conflictingStores   43563
+ss        squashedLoads       16260
+ss        memOrderViolation   85
+ss        loadConflictRatio   0.599218589348139
+ss        storeConflictRatio  0.6870810529470215
+
+Benchmark: b06_multst
+phast     ipc                 0.868546
+phast     insertedLoads       183373
+phast     insertedStores      112181
+phast     conflictingLoads    134638
+phast     conflictingStores   51
+phast     squashedLoads       48870
+phast     memOrderViolation   7102
+phast     loadConflictRatio   0.7342302301865596
+phast     storeConflictRatio  0.0004546224405202307
+ss        ipc                 0.8984
+ss        insertedLoads       147612
+ss        insertedStores      89548
+ss        conflictingLoads    112289
+ss        conflictingStores   42060
+ss        squashedLoads       13109
+ss        memOrderViolation   81
+ss        loadConflictRatio   0.7607037368235645
+ss        storeConflictRatio  0.46969223209898603
+
+Benchmark: b07_altprod16
+phast     ipc                 0.957291
+phast     insertedLoads       163586
+phast     insertedStores      89886
+phast     conflictingLoads    102565
+phast     conflictingStores   51
+phast     squashedLoads       49097
+phast     memOrderViolation   4664
+phast     loadConflictRatio   0.6269790813394789
+phast     storeConflictRatio  0.0005673853547827248
+ss        ipc                 1.023448
+ss        insertedLoads       142130
+ss        insertedStores      78060
+ss        conflictingLoads    93307
+ss        conflictingStores   30220
+ss        squashedLoads       27641
+ss        memOrderViolation   80
+ss        loadConflictRatio   0.6564905368324773
+ss        storeConflictRatio  0.3871380988982834
+
+Benchmark: b08_ptralias
+phast     ipc                 0.831373
+phast     insertedLoads       231290
+phast     insertedStores      96976
+phast     conflictingLoads    152018
+phast     conflictingStores   50
+phast     squashedLoads       98563
+phast     memOrderViolation   27572
+phast     loadConflictRatio   0.6572614466686844
+phast     storeConflictRatio  0.000515591486553374
+ss        ipc                 0.914372
+ss        insertedLoads       145893
+ss        insertedStores      62685
+ss        conflictingLoads    94698
+ss        conflictingStores   42091
+ss        squashedLoads       13166
+ss        memOrderViolation   86
+ss        loadConflictRatio   0.6490921428718307
+ss        storeConflictRatio  0.6714684533780011
+
+Benchmark: b09_multld
+phast     ipc                 0.717054
+phast     insertedLoads       413122
+phast     insertedStores      160336
+phast     conflictingLoads    260860
+phast     conflictingStores   51
+phast     squashedLoads       228605
+phast     memOrderViolation   30912
+phast     loadConflictRatio   0.6314357502142224
+phast     storeConflictRatio  0.00031808202774174236
+ss        ipc                 0.908456
+ss        insertedLoads       197683
+ss        insertedStores      79548
+ss        conflictingLoads    162310
+ss        conflictingStores   62077
+ss        squashedLoads       13166
+ss        memOrderViolation   90
+ss        loadConflictRatio   0.821062003308327
+ss        storeConflictRatio  0.7803715995373862
+
+Benchmark: b10_falsealias
+phast     ipc                 0.864497
+phast     insertedLoads       255140
+phast     insertedStores      113403
+phast     conflictingLoads    149799
+phast     conflictingStores   56
+phast     squashedLoads       86225
+phast     memOrderViolation   16991
+phast     loadConflictRatio   0.5871247158422827
+phast     storeConflictRatio  0.000493814096628837
+ss        ipc                 0.914259
+ss        insertedLoads       182717
+ss        insertedStores      82374
+ss        conflictingLoads    115622
+ss        conflictingStores   53153
+ss        squashedLoads       13802
+ss        memOrderViolation   83
+ss        loadConflictRatio   0.6327927888483282
+ss        storeConflictRatio  0.64526428241921
+
+Benchmark: b11_stchain
+phast     ipc                 0.630713
+phast     insertedLoads       180703
+phast     insertedStores      105684
+phast     conflictingLoads    131840
+phast     conflictingStores   51
+phast     squashedLoads       56200
+phast     memOrderViolation   10190
+phast     loadConflictRatio   0.7295949707531142
+phast     storeConflictRatio  0.00048257068241171794
+ss        ipc                 0.650196
+ss        insertedLoads       137633
+ss        insertedStores      79575
+ss        conflictingLoads    102322
+ss        conflictingStores   62056
+ss        squashedLoads       13130
+ss        memOrderViolation   83
+ss        loadConflictRatio   0.7434408899028576
+ss        storeConflictRatio  0.7798429154885328
+
+Benchmark: b12_randctrl
+phast     ipc                 1.072453
+phast     insertedLoads       154128
+phast     insertedStores      88164
+phast     conflictingLoads    66851
+phast     conflictingStores   51
+phast     squashedLoads       29667
+phast     memOrderViolation   3511
+phast     loadConflictRatio   0.43373689401017335
+phast     storeConflictRatio  0.0005784674016605417
+ss        ipc                 1.125941
+ss        insertedLoads       137622
+ss        insertedStores      79573
+ss        conflictingLoads    92310
+ss        conflictingStores   47066
+ss        squashedLoads       13161
+ss        memOrderViolation   83
+ss        loadConflictRatio   0.6707503160831844
+ss        storeConflictRatio  0.591482035363754
+
+Benchmark: b13_ctxdepth
+phast     ipc                 1.172841
+phast     insertedLoads       159604
+phast     insertedStores      75045
+phast     conflictingLoads    70332
+phast     conflictingStores   51
+phast     squashedLoads       25143
+phast     memOrderViolation   2057
+phast     loadConflictRatio   0.4406656474775068
+phast     storeConflictRatio  0.0006795922446532081
+ss        ipc                 1.243695
+ss        insertedLoads       147682
+ss        insertedStores      69588
+ss        conflictingLoads    69783
+ss        conflictingStores   14573
+ss        squashedLoads       13221
+ss        memOrderViolation   81
+ss        loadConflictRatio   0.47252204060075026
+ss        storeConflictRatio  0.20941829050985802
+
+Benchmark: b14_prodchurn
+phast     ipc                 1.230029
+phast     insertedLoads       145925
+phast     insertedStores      79676
+phast     conflictingLoads    57456
+phast     conflictingStores   51
+phast     squashedLoads       31450
+phast     memOrderViolation   1884
+phast     loadConflictRatio   0.3937365084803838
+phast     storeConflictRatio  0.0006400923741151665
+ss        ipc                 1.306467
+ss        insertedLoads       132050
+ss        insertedStores      72404
+ss        conflictingLoads    54478
+ss        conflictingStores   12553
+ss        squashedLoads       17575
+ss        memOrderViolation   77
+ss        loadConflictRatio   0.4125558500567967
+ss        storeConflictRatio  0.17337439920446385
+
+Benchmark: b15_pathalias
+phast     ipc                 1.022038
+phast     insertedLoads       290884
+phast     insertedStores      109925
+phast     conflictingLoads    170188
+phast     conflictingStores   53
+phast     squashedLoads       91931
+phast     memOrderViolation   12773
+phast     loadConflictRatio   0.5850717124351975
+phast     storeConflictRatio  0.0004821469183534228
+ss        ipc                 1.133016
+ss        insertedLoads       213602
+ss        insertedStores      82287
+ss        conflictingLoads    146138
+ss        conflictingStores   43233
+ss        squashedLoads       14649
+ss        memOrderViolation   102
+ss        loadConflictRatio   0.6841602606717165
+ss        storeConflictRatio  0.5253928324036604
