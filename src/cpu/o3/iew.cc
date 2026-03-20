@@ -1330,12 +1330,6 @@ IEW::executeInsts()
 
                 fetchRedirect[tid] = true;
 
-                // PHAST: Store the violating store on the load for lazy
-                // training at commit time (paper Section IV-A1).
-                if (o3::usePhast) {
-                    violator->phastViolationStore = inst;
-                }
-
                 // Tell the instruction queue that a violation has occured.
                 instQueue.violation(inst, violator);
 

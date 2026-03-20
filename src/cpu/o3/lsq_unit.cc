@@ -588,6 +588,20 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                     continue;
                 }
 
+                if (usePhast) {
+                    // PHAST lazy squash: flag the load with the youngest
+                    // conflicting store. Do NOT set memDepViolator or return
+                    // a fault -- let the pipeline continue so all conflicting
+                    // stores can execute before the squash at commit.
+                    if (!ld_inst->phastViolationStore ||
+                        inst->seqNum > ld_inst->phastViolationStore->seqNum) {
+                        ld_inst->phastViolationStore = inst;
+                    }
+                    ++loadIt;
+                    continue;
+                }
+
+                // Store Sets path (eager squash):
                 // A load/store incorrectly passed this store.
                 // Check if we already have a violator, or if it's newer
                 // squash and refetch.

@@ -816,13 +816,6 @@ Commit::commit()
                 auto violator_inst = rob->findInst(tid, fromIEW->squashedSeqNum[tid] - fromIEW->includeSquashInst[tid]);
                 if (violator_inst) {
                     phast->squashBranches(violator_inst->phastDecodeBranchCount);
-
-                    // PHAST: Lazy training -- train predictor at commit time
-                    // instead of at detection time (paper Section IV-A1).
-                    if (usePhast && violator_inst->phastViolationStore) {
-                        phast->violation(violator_inst->phastViolationStore,
-                                         violator_inst);
-                    }
                 }
             }
 
@@ -1289,6 +1282,25 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     for (int i = 0; i < head_inst->numDestRegs(); i++) {
         renameMap[tid]->setEntry(head_inst->flattenedDestIdx(i),
                                  head_inst->renamedDestIdx(i));
+    }
+
+    // PHAST lazy squash: if this load was flagged with a memory order
+    // violation, train PHAST and trigger squash instead of committing.
+    if (usePhast && head_inst->isLoad() && head_inst->phastViolationStore) {
+        DPRINTF(Commit, "[tid:%i] [sn:%llu] PHAST lazy squash: load has "
+                "violation from store [sn:%llu], squashing\n",
+                tid, head_inst->seqNum,
+                head_inst->phastViolationStore->seqNum);
+
+        auto phast = cpu->getPhast(tid);
+        phast->violation(head_inst->phastViolationStore, head_inst);
+        phast->squashBranches(head_inst->phastDecodeBranchCount);
+
+        // pc[tid] is already set to head_inst->pcState() at line 1007
+        squashAll(tid);
+        commitStatus[tid] = ROBSquashing;
+        cpu->activityThisCycle();
+        return false;  // Do not commit this load
     }
 
     // hardware transactional memory
