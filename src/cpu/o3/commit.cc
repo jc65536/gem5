@@ -1314,6 +1314,13 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         phast->updateConfidence(head_inst);
     }
 
+    // PHAST: Remove stores from memDepHash at commit time (they were
+    // kept alive after execution so younger loads could establish
+    // dependencies on them).
+    if (usePhast && (head_inst->isStore() || head_inst->isAtomic())) {
+        iewStage->instQueue.commitStore(head_inst);
+    }
+
     // Finally clear the head ROB entry.
     rob->retireHead(tid);
 

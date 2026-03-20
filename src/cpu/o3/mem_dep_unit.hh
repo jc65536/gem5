@@ -149,6 +149,9 @@ class MemDepUnit
     /** Notifies completion of an instruction. */
     void completeInst(const DynInstPtr &inst);
 
+    /** Removes a store from the hash at commit time (PHAST only). */
+    void commitStore(const DynInstPtr &inst);
+
     /** Squashes all instructions up until a given sequence number for a
      *  specific thread.
      */

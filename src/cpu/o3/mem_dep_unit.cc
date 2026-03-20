@@ -469,6 +469,17 @@ void
 MemDepUnit::completeInst(const DynInstPtr &inst)
 {
     wakeDependents(inst);
+
+    // PHAST: Keep stores in the hash until commit so that younger loads
+    // dispatched after the store executes can still find it and establish
+    // dependencies. Without this, storeDistToSeqNum returns a valid seqNum
+    // but memDepHash.find() fails (producerNotInHash).
+    if (usePhast && (inst->isStore() || inst->isAtomic()) &&
+        !inst->isReadBarrier() && !inst->isWriteBarrier() &&
+        !inst->isHtmCmd()) {
+        return;
+    }
+
     completed(inst);
     InstSeqNum barr_sn = inst->seqNum;
 
@@ -493,6 +504,17 @@ MemDepUnit::completeInst(const DynInstPtr &inst)
             DPRINTF(MemDepUnit, "%s barrier completed: %s SN:%lli\n",
                                 barrier_type, inst->pcState(), inst->seqNum);
         }
+    }
+}
+
+void
+MemDepUnit::commitStore(const DynInstPtr &inst)
+{
+    // Called at commit time for PHAST stores that were kept in the hash
+    // after execution (see completeInst). Now safe to remove.
+    MemDepHashIt hash_it = memDepHash.find(inst->seqNum);
+    if (hash_it != memDepHash.end()) {
+        completed(inst);
     }
 }
 
