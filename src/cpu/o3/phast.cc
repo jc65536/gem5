@@ -358,20 +358,24 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             set[w].confidence = MAX_CONFIDENCE;
             stats.numCorrectPredictions++;
             DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-        } else if (set[w].confidence > 0) {
-            // TODO: Confidence decrement disabled for debugging.
-            // set[w].confidence--;
-            stats.numIncorrectPredictions++;
-            if (load_inst->forwardingStoreSeqNum == 0) {
-                stats.numFPNoForwarding++;
-            } else {
-                stats.numFPDifferentStore++;
+        } else if (load_inst->forwardingStoreSeqNum != 0) {
+            // Forwarding came from a different store than predicted —
+            // genuine false positive. Decrement confidence.
+            if (set[w].confidence > 0) {
+                set[w].confidence--;
             }
-            DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d "
+            stats.numIncorrectPredictions++;
+            stats.numFPDifferentStore++;
+            DPRINTF(Phast, "updateConfidence: [%d] FP (different store) predictedStoreDist = %d "
                     "predicted_sn = %d forwarding_sn = %d\n",
                     load_inst->seqNum, load_inst->predictedStoreDist,
                     load_inst->predictedStoreSeqNum,
                     load_inst->forwardingStoreSeqNum);
+        } else {
+            // No forwarding (forwardingStoreSeqNum == 0). Could be a true
+            // FP or a correct prediction where the store committed before
+            // the load executed. Don't decrement — can't distinguish.
+            stats.numFPNoForwarding++;
         }
         updateLRU(set, w);
     } else {
