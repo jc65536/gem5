@@ -36,6 +36,8 @@ def parse_results(predictor: str) -> dict[str, dict[str, int | float]]:
                         results["ipc"][b] = float(ipc)
                     case ["board.processor.cores.core.lsq0.squashedLoads", squashed_loads]:
                         results["squashedLoads"][b] = int(squashed_loads)
+                    case ["board.processor.cores.core.lsq0.squashedStores", squashed_stores]:
+                        results["squashedStores"][b] = int(squashed_stores)
                     case ["board.processor.cores.core.lsq0.memOrderViolation", mem_order_violation]:
                         results["memOrderViolation"][b] = int(mem_order_violation)
                     case ["board.processor.cores.core.phast0.checkInstCalls", checkInstCalls]:
@@ -54,6 +56,10 @@ def parse_results(predictor: str) -> dict[str, dict[str, int | float]]:
                         results["violationCalls"][b] = int(violationCalls)
                     case ["board.processor.cores.core.phast0.violationClears", violationClears]:
                         results["violationClears"][b] = int(violationClears)
+                    case ["board.processor.cores.core.phast0.numFPNoForwarding", numFPNoForwarding]:
+                        results["numFPNoForwarding"][b] = int(numFPNoForwarding)
+                    case ["board.processor.cores.core.phast0.numFPDifferentStore", numFPDifferentStore]:
+                        results["numFPDifferentStore"][b] = int(numFPDifferentStore)
     
     # json.dump(results, sys.stdout, indent=2)
     return results
