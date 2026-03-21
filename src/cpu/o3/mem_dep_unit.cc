@@ -267,6 +267,10 @@ MemDepUnit::insert(const DynInstPtr &inst)
             if (entry->completed) {
                 DPRINTF(MemDepUnit, "Producer [sn:%lli] already executed, "
                         "skipping dependency\n", producing_store);
+                // Clear prediction info so updateConfidence doesn't
+                // penalize the entry for a prediction that was bypassed.
+                inst->predictedEntrySetPtr = nullptr;
+                inst->predictedStoreSeqNum = 0;
             } else {
                 store_entries.push_back(entry);
                 DPRINTF(MemDepUnit, "Producer found\n");
@@ -278,6 +282,9 @@ MemDepUnit::insert(const DynInstPtr &inst)
                     producing_store, inst->seqNum,
                     inst->pcState().instAddr(),
                     inst->predictedStoreDist, inst->sqIdx);
+            // Clear prediction info so confidence isn't penalized.
+            inst->predictedEntrySetPtr = nullptr;
+            inst->predictedStoreSeqNum = 0;
         }
     }
 
