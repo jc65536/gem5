@@ -585,6 +585,7 @@ for variant_path in variant_paths:
         # As gcc and clang share many flags, do the common parts here
         env.Append(CCFLAGS=['-pipe'])
         env.Append(CCFLAGS=['-fno-strict-aliasing'])
+        env.Append(LINKFLAGS=['-fuse-ld=mold'])
 
         # Enable -Wall and -Wextra and then disable the few warnings that
         # we consistently violate
