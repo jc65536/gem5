@@ -114,6 +114,10 @@ class Phast : public Named
         statistics::Scalar numIncorrectPredictions;
         statistics::Scalar numPredictionsNotFound;
 
+        // Confidence mismatch breakdown
+        statistics::Scalar numFPNoForwarding;
+        statistics::Scalar numFPDifferentStore;
+
         // Diagnostic stats for checkInst
         statistics::Scalar checkInstCalls;
         statistics::Scalar checkInstNoEntry;

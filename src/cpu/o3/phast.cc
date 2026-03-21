@@ -357,10 +357,13 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
         } else if (set[w].confidence > 0) {
             // TODO: Confidence decrement disabled for debugging.
-            // Uncomment to re-enable once the root cause of false
-            // decrements is understood.
             // set[w].confidence--;
             stats.numIncorrectPredictions++;
+            if (load_inst->forwardingStoreSeqNum == 0) {
+                stats.numFPNoForwarding++;
+            } else {
+                stats.numFPDifferentStore++;
+            }
             DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d "
                     "predicted_sn = %d forwarding_sn = %d\n",
                     load_inst->seqNum, load_inst->predictedStoreDist,
@@ -420,6 +423,10 @@ Phast::PhastStats::PhastStats(statistics::Group *parent)
                "Number of predictions that were incorrect"),
       ADD_STAT(numPredictionsNotFound, statistics::units::Count::get(),
                "Number of predictions that were not found"),
+      ADD_STAT(numFPNoForwarding, statistics::units::Count::get(),
+               "FP: predicted dependency but no forwarding happened"),
+      ADD_STAT(numFPDifferentStore, statistics::units::Count::get(),
+               "FP: predicted dependency but forwarding from different store"),
       ADD_STAT(checkInstCalls, statistics::units::Count::get(),
                "Number of checkInst calls for loads"),
       ADD_STAT(checkInstNoEntry, statistics::units::Count::get(),
