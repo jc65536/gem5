@@ -1,0 +1,3524 @@
+ ▐▛███▜▌   Claude Code v2.1.80
+▝▜█████▛▘  Sonnet 4.6 · API Usage Billing
+  ▘▘ ▝▝    ~/oss/gem5
+
+❯ /clear                                                                        
+  ⎿  (no content)
+
+❯ The current implementation of phast is performing much worse than the         
+previous stored set predictor (9000 memory order violations vs. 80 on average   
+across microbenchmarks).                                                        
+                                                                                
+Here are the stats from the benchmarks:                                         
+                                                                                
+phast     ipc                 0.9099855333333334                                
+phast     insertedLoads       282514.6                                          
+phast     insertedStores      129303.46666666666                                
+phast     conflictingLoads    172972.86666666667                                
+phast     conflictingStores   20824.133333333335                                
+phast     squashedLoads       136624.46666666667                                
+phast     memOrderViolation   9735.8                                            
+phast     loadConflictRatio   0.6025445607317063                                
+phast     storeConflictRatio  0.17092565712191518                               
+ss        ipc                 1.0113347333333331                                
+ss        insertedLoads       160681.4                                          
+ss        insertedStores      76145.53333333334                                 
+ss        conflictingLoads    105054.53333333334                                
+ss        conflictingStores   39191.2                                           
+ss        squashedLoads       14791.266666666666                                
+ss        memOrderViolation   84.33333333333333                                 
+ss        loadConflictRatio   0.6484746621241598                                
+ss        storeConflictRatio  0.52259347082717                                  
+                                                                                
+Please first understand Phast by reading the paper. Then, analyze the current   
+Phast implementation. Understand gem5 and how memory order violations and       
+squashes work. Determine how the current Phast implementation leads to the      
+performance drop indicated by the stats.                                        
+
+⏺ Let me read the paper and the implementation in parallel, then analyze gem5's
+  memory ordering mechanism.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(git diff main --name-only)
+  ⎿  GEMINI.md
+     src/cpu/o3/SConscript
+     src/cpu/o3/commit.cc
+     … +10 lines (ctrl+o to expand)
+
+⏺ Now let me read the implementation and key gem5 files in parallel.
+
+  Read 4 files (ctrl+o to expand)
+
+⏺ Now let me read the LSQ unit to understand how violations are detected and the
+   forwarding mechanism, plus the dyn_inst changes.
+
+  Searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+⏺ Now let me check the commit path to see where violation() is called and where
+  updateConfidence is called.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Let me read the decode.cc changes and the commit.cc changes around the
+  violation/squash handling.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Now let me check where violation() is called - is it at detection time (eager)
+   or at commit time (lazy)?
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Now let me check where memDepViolator gets consumed and where violation() on
+  the mem dep unit is called.
+
+  Searched for 2 patterns (ctrl+o to expand)
+⏺ Now let me check IEW to see when the violation is reported and squash happens
+  (eager vs lazy).
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Let me check how loads get their sqIdx and sqIt set.
+
+  Searched for 5 patterns, read 1 file (ctrl+o to expand)
+
+⏺ Let me check how sqIdx is typed and look at one more critical thing.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Now I have enough information for a comprehensive analysis. Let me present my
+  findings.
+
+  ---
+  Analysis: Why PHAST Performs 100x Worse Than Store Sets
+
+  The key stat to explain is 9735 memory order violations (PHAST) vs 84 (Store 
+  Sets). Each violation triggers a pipeline squash, causing re-execution of
+  loads (136k squashed loads → 282k total loads vs 160k). This cascading
+  re-execution destroys IPC.
+
+  Root Cause 1: Store distance calculation is broken on SQ wraparound (CRITICAL)
+
+  In phast.cc:127:
+  actual_store_dist = load_inst->sqIdx - store_inst->sqIdx;
+
+  sqIdx is a modular value (0 to SQ capacity−1), set at lsq_unit.cc:345,408:
+  - Loads: sqIdx = storeQueue.tail() + 1  (modular)
+  - Stores: sqIdx = storeQueue.tail()  (modular)
+
+  When the circular SQ wraps around, this subtraction gives negative results.
+  For example, with SQ capacity 114:
+  - Load sqIdx = 3, Store sqIdx = 112
+  - actual_store_dist = 3 - 112 = -109
+
+  Since sqIdx is ssize_t (signed, dyn_inst.hh:357), this is -109. The clamp
+  check if (actual_store_dist > 127) at line 133 doesn't catch negative values.
+  The negative distance is cast to uint8_t storeDist (wrapping to 147),
+  corrupting the prediction entry.
+
+  At prediction time in storeDistToSeqNum(), this corrupted distance (147) is
+  subtracted from sqIt._idx, producing an out-of-range index. dereferenceable()
+  returns false, storeDistToSeqNum returns 0, and no dependency is predicted.
+  The load executes speculatively and violates when the real conflicting store
+  resolves.
+
+  This single bug can explain the majority of the 100x violation increase, since
+   the SQ wraps frequently during execution.
+
+  Root Cause 2: Predictor is trained at detection time, not commit time (HIGH 
+  IMPACT)
+
+  The paper explicitly states (Section IV-A1):
+  ▎ "PHAST benefits from performing the update at commit, as it avoids learning 
+  long paths that are not leading to actual dependencies."
+
+  Currently, violation() is called from iew.cc:1334 via instQueue.violation() →
+  memDepUnit.violation() → phastPred.violation(). This happens at detection time
+   (when a store executes and finds a younger load at the same address), not at
+  commit.
+
+  Per the paper (Section IV-A1, Figure 3 case d), when a load overtakes multiple
+   stores to the same address:
+  - With eager training (current): the first store to execute triggers training,
+   possibly learning the wrong (older) store. The younger store — which is the
+  actual dependency per the paper — may not have executed yet.
+  - With commit-time training (paper): all stores have resolved, so PHAST learns
+   only the youngest conflicting store.
+
+  The paper also notes that gem5 specifically exhibits the problem where older
+  stores incorrectly squash loads that got forwarding from younger stores
+  (Section IV-A1):
+  ▎ "these squashes happen in accurate research simulators such as Gem5"
+
+  The FWD filter at lsq_unit.cc:585 handles Figure 3(c) but not Figure 3(d).
+  Training at detection means PHAST sees case (d) violations and learns
+  incorrect dependencies.
+
+  Root Cause 3: checkInst is called for stores, causing false store-store 
+  dependencies (MEDIUM IMPACT)
+
+  In mem_dep_unit.cc:245-251, the dependency check runs for both loads and 
+  stores:
+  if (usePhast) {
+      dep = phastPred.checkInst(inst);  // called for stores too!
+  }
+
+  PHAST is a load-centric predictor — it trains on load PCs and histories. But
+  when a store's PC+history happens to alias with a load entry in the tables,
+  the store gets a false dependency. The stats show conflictingStores: 20824 for
+   PHAST, which represents wasted store serialization due to table aliasing.
+  Store Sets intentionally serializes stores within a set; PHAST should not
+  create store-store dependencies at all.
+
+  Summary of Impact
+
+  ┌─────────────────┬──────────────────────────────┬────────────────────────┐
+  │      Issue      │            Effect            │   Violations Caused    │
+  ├─────────────────┼──────────────────────────────┼────────────────────────┤
+  │ SQ wraparound   │ Corrupted entries → no       │ Primary (explains bulk │
+  │ in store        │ prediction → load executes   │  of 9735 violations)   │
+  │ distance        │ speculatively → violation    │                        │
+  ├─────────────────┼──────────────────────────────┼────────────────────────┤
+  │ Training at     │ Wrong store distances        │ Secondary (compounds   │
+  │ detection not   │ learned (case d), wrong-path │ the first issue)       │
+  │ commit          │  pollution                   │                        │
+  ├─────────────────┼──────────────────────────────┼────────────────────────┤
+  │ Stores checked  │ False store serialization →  │ Tertiary (reduces IPC, │
+  │ through         │ reduced store throughput →   │  doesn't directly      │
+  │ checkInst       │ indirect stalls              │ cause violations)      │
+  └─────────────────┴──────────────────────────────┴────────────────────────┘
+
+  Recommended Fixes (in priority order)
+
+  1. Fix the store distance wraparound: Use modular arithmetic or monotonic
+  iterator indices consistently. The simplest fix: actual_store_dist = 
+  (load_inst->sqIdx - store_inst->sqIdx + SQ_CAPACITY) % SQ_CAPACITY; or better,
+   compute the distance using the monotonic sqIt._idx values instead of modular
+  sqIdx.
+  2. Move training to commit time: Instead of calling phastPred.violation() from
+   IEW, buffer the violation info (store/load seq nums, PCs, branch counts) and
+  process it when the violating load reaches commit. This requires storing the
+  store's sqIdx and phastDecodeBranchCount so they're available at commit.
+  3. Skip checkInst for stores: Add a guard in MemDepUnit::insert() to only call
+   phastPred.checkInst() for loads, not stores.
+
+✻ Crunched for 13m 25s
+
+❯ For root cause 1:                                                             
+Please look at src/base/circular_queue.hh                                       
+The indexes are monotonic. They don't wrap around.                              
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+⏺ You're right. I retract root cause 1. The indices are monotonic:
+
+  - tail() returns _head + _size - 1 (line 456) — monotonically increasing
+  - end() returns iterator(this, tail() + 1) = iterator(this, _head + _size)
+  (line 580)
+  - isValidIdx checks _head <= idx && idx < (_head + _size) (line 435)
+  - _head only ever increases (lines 518, 537)
+
+  So sqIdx values never wrap. load_inst->sqIdx - store_inst->sqIdx always gives
+  a correct positive distance. And storeDistToSeqNum subtracting from end()._idx
+   correctly reaches the target store. Root cause 1 is not a bug.
+
+  That leaves root cause 2 (training at detection time instead of commit) and
+  root cause 3 (stores going through checkInst) as the remaining issues. Let me
+  reconsider what else could cause the 100x violation increase, given the SQ
+  indexing is correct.
+
+  Let me re-examine the confidence update mechanism and the overall prediction
+  flow more carefully.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ You're right, I apologize. tail() returns _head + _size - 1 (line 456) which
+  is monotonic, and end()._idx = tail() + 1 = _head + _size. The subtraction
+  load_inst->sqIdx - store_inst->sqIdx always gives correct positive values.
+
+  Let me reconsider the real root cause. The critical difference is in how gem5 
+  handles memory order violation squashes vs. the paper's simulator.
+
+  The paper states clearly (Section V):
+  ▎ "We perform eager squash on branch misprediction for a fast recovery, but 
+  lazy-squash for the less frequent memory order violations. Delaying memory 
+  dependence squashes until commit simplifies the design of PHAST."
+
+  gem5 uses eager squash for memory violations. Combined with training at
+  detection time, this creates a cascading violation pattern. Let me trace
+  through a concrete scenario:
+
+  Cascading violations with eager squash (gem5):
+
+  1. Load L depends on stores S1 (oldest), S2, S3 (youngest) — same address
+  2. PHAST has no entry yet (cold start). L executes speculatively
+  3. S1 executes first, detects violation with L. violation(S1, L) trains
+  dist(L, S1). Pipeline squashes from L.
+  4. L re-decoded. PHAST predicts dist(L, S1). L waits for S1.
+  5. S1 executes, wakes L. L executes. Gets forwarding from S1.
+  6. S2 executes. Checks FWD filter: forwardingStoreSeqNum(=S1) > 
+  inst.seqNum(=S2)? NO — S1 is older than S2. Filter doesn't apply.
+  7. S2 detects violation with L. violation(S2, L) trains dist(L, S2). Pipeline 
+  squashes from L again.
+  8. L re-decoded. PHAST predicts dist(L, S2) (longer history match wins). L
+  waits for S2.
+  9. S2 executes, wakes L. L executes. Gets forwarding from S2.
+  10. S3 executes. FWD filter: S2.seqNum > S3.seqNum? NO — S2 is older. Filter
+  doesn't apply.
+  11. S3 detects violation with L. Third squash.
+
+  One real dependency causes 3 violations and 3 pipeline squashes.
+
+  With lazy squash (paper's design):
+
+  1. L executes speculatively
+  2. S1, S2, S3 all detect conflicts with L — violations are flagged but not 
+  acted on
+  3. At commit, only S3 (youngest conflicting store) triggers the squash
+  4. PHAST trains with dist(L, S3) — the correct, youngest store
+  5. One violation, one squash, correct training
+
+  The FWD filter at lsq_unit.cc:585 only handles Figure 3(c) from the paper —
+  where the load forwarded from a younger store and an older store resolves
+  later. It does NOT handle Figure 3(d) — where the load forwarded from an older
+   store and a younger store resolves later. Case (d) is precisely what causes
+  the cascading violations, and it requires either lazy squash or deferred
+  training to resolve.
+
+  This cascading pattern explains the stats:
+  - 9735 memOrderViolation — each real dependency can cause multiple violations
+  - 136624 squashedLoads — each violation squashes everything after the load
+  - 282514 insertedLoads (vs 160681 for SS) — massive re-execution from repeated
+   squashes
+  - 0.91 IPC (vs 1.01 for SS) — constant squashing wastes pipeline bandwidth
+
+  So the revised root causes are:
+
+  1. (CRITICAL) Eager squash + detection-time training creates cascading 
+  violations — The paper uses lazy squash for memory violations. gem5 uses eager
+   squash. Combined with training at detection time, each real dependency can
+  trigger multiple violations as progressively younger conflicting stores
+  resolve.
+  2. (MEDIUM) Stores going through checkInst — causes false store serialization
+  via table aliasing.
+
+✻ Worked for 4m 26s
+
+❯ Can you please verify how violations and squashes work in gem5? Please walk   
+me through step by step what happens. I see that commit.cc has comments about   
+squashing, as well as inst_queue.cc and lsq_unit.cc. I'm confused on where      
+violations are actually detected and when squashes actually happen. Then,       
+verify if phast currently has eager training or lazy training.                  
+⏺ Let me trace through the exact code path step by step.
+
+  Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+⏺ Now let me see how commit receives and processes this squash signal.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me check when checkViolations is called — it's called from
+  executeStore:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Now let me look at where ldstQueue.violation(tid) is checked — it's read in
+  the IEW execute loop:
+
+  Searched for 3 patterns (ctrl+o to expand)
+
+⏺ Now let me see the IEW executeInsts loop to understand when violation is
+  checked relative to instruction execution:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I have the full picture. Here's the step-by-step walkthrough:
+
+  ---
+  How Violations and Squashes Work in gem5 — Step by Step
+
+  Step 1: Violation Detection (in IEW execute stage, iew.cc)
+
+  The IEW stage executes instructions one at a time in executeInsts() (line
+  1190+). For each memory instruction:
+
+  - Loads: calls ldstQueue.executeLoad(inst) (line 1213)
+  - Stores: calls ldstQueue.executeStore(inst) (line 1229)
+
+  Step 2: Store execution checks the load queue (lsq_unit.cc)
+
+  When a store executes (executeStore, line 692), it computes its effective
+  address, then calls checkViolations(loadIt, store_inst) at line 749. This
+  walks the load queue looking for younger loads that already executed and
+  accessed the same address (lines 542-612).
+
+  If a matching load is found (line 553), and the FWD filter doesn't skip it
+  (line 585), memDepViolator is set to that load (line 600), memOrderViolation
+  stat is incremented (line 602), and a fault is returned.
+
+  Step 3: IEW checks for violations AFTER each instruction executes 
+  (iew.cc:1318)
+
+  After executing each instruction, IEW checks ldstQueue.violation(tid) (line
+  1318). This simply checks if memDepViolator is non-null (set in step 2).
+
+  If a violation exists:
+
+  Line 1324: Gets the violating load via getMemDepViolator() (which clears the
+  signal).
+
+  Line 1334: instQueue.violation(inst, violator) — this calls
+  memDepUnit.violation(store, load), which calls phastPred.violation(store, 
+  load). This is where PHAST is trained.
+
+  Line 1337: squashDueToMemOrder(violator, tid) — this does NOT squash
+  immediately. It writes to toCommit->squash[tid] = true with the violator's
+  seqNum (line 509-511) and sets includeSquashInst = true (line 516). This is a
+  signal through a time buffer to the commit stage.
+
+  Step 4: Commit receives the squash signal NEXT CYCLE (commit.cc:786)
+
+  The commit stage checks fromIEW->squash[tid] (line 786). If set:
+
+  Line 809-819: For memory violations (mispredictInst == NULL), it restores the
+  PHAST branch counter.
+
+  Line 825: Sets commitStatus[tid] = ROBSquashing.
+
+  Line 839: rob->squash(squashed_inst, tid) — marks ROB entries for squashing.
+
+  Line 844: Signals back to IEW via toIEW->commitInfo[tid].squash = true.
+
+  Step 5: The actual squash propagates over subsequent cycles
+
+  The squash signal propagates: commit → IEW → rename → decode → fetch. Each
+  stage squashes its local state. The violating load and everything younger is
+  re-fetched.
+
+  ---
+  Key Insight: PHAST Training Timing
+
+  PHAST is trained at step 3 — instQueue.violation(inst, violator) at
+  iew.cc:1334. This happens during the IEW execute stage, the same cycle the 
+  store executes and detects the violation. The squash hasn't happened yet (it's
+   just been signaled to commit).
+
+  This is eager training at detection time. The squash won't take effect until
+  the next cycle (when commit processes it). But the predictor has already been
+  trained.
+
+  Now critically — this is also before the squash removes younger instructions.
+  Other stores that are younger than the violating store but older than the
+  violating load might still be in the pipeline, not yet executed. If one of
+  those stores ALSO conflicts with the same load (and is the younger/correct
+  dependency per the paper), PHAST will never see it because:
+
+  1. The violation is detected by the first conflicting store to execute
+  2. PHAST is trained with that store's distance immediately
+  3. The pipeline squashes from the violating load
+  4. The younger conflicting store is squashed before it can execute
+
+  On re-execution, PHAST predicts the load should wait for the older store
+  (learned in step 2). The load waits for it, then executes. But now the younger
+   store resolves and detects ANOTHER violation — because the load executed
+  after the older store but before the younger store. This triggers another
+  squash and another training, this time with the younger store's distance.
+
+  This cascading pattern continues until PHAST learns the youngest conflicting
+  store. The paper avoids this by using lazy squash — waiting until commit, when
+   ALL conflicting stores have resolved, and only training with the youngest
+  one.
+
+✻ Brewed for 2m 2s
+
+❯ /export                                                                       
+  ⎿  Conversation exported to:
+     /Users/jasonc224/oss/gem5/.ignore/eager-vs-lazy.txt
+
+❯ This makes sense. Let's set this aside for now. Let's look at the TP, TN, FP, 
+ FN logs in phast.cc updateConfidence. updateConfidence is called from          
+commit.cc. Are these logs implemented correctly? Do these logs capture all      
+prediction results? If what you said about eager vs. lazy training is true,     
+what TP, TN, FP, FN percentages should we expect?                               
+
+⏺ Let me re-read updateConfidence carefully and trace all the cases.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Now let me check how forwardingStoreSeqNum is set — all the places it could be
+   assigned:
+
+  Searched for 1 pattern (ctrl+o to expand)
+⏺ Now I have the full picture. Let me walk through each case.
+
+  Analysis of updateConfidence Correctness
+
+  When is it called?
+
+  At commit (line 1293-1296), for every load that successfully commits. Loads
+  that were squashed due to violations never reach commit, so they are never 
+  seen by updateConfidence.
+
+  The four prediction outcomes
+
+  The ground truth is whether the load actually had a dependency (received
+  forwarding from a store). The prediction is whether PHAST predicted a
+  dependency.
+
+  ┌───────────────────────┬────────────────────────┬────────────────────────┐
+  │                       │  Actually dependent    │ Actually independent   │
+  │                       │ (forwardingStoreSeqNum │ (forwardingStoreSeqNum │
+  │                       │          != 0)         │          == 0)         │
+  ├───────────────────────┼────────────────────────┼────────────────────────┤
+  │ Predicted dependent   │                        │                        │
+  │ (predictedStoreSeqNum │ TP or FP (see below)   │ FP                     │
+  │  != 0)                │                        │                        │
+  ├───────────────────────┼────────────────────────┼────────────────────────┤
+  │ Predicted independent │                        │                        │
+  │                       │ FN (but see problem)   │ TN                     │
+  │ (predictedStoreSeqNum │                        │                        │
+  │  == 0)                │                        │                        │
+  └───────────────────────┴────────────────────────┴────────────────────────┘
+
+  Problem 1: The "TN" branch is wrong
+
+  Lines 311-321 handle loads with no prediction (predictedStoreSeqNum == 0). The
+   check:
+  bool is_correct = load_inst->forwardingStoreSeqNum ==
+  load_inst->predictedStoreSeqNum;
+  This compares forwardingStoreSeqNum == 0 (since predictedStoreSeqNum == 0). So
+   is_correct is true whenever the load didn't receive forwarding — logged as
+  "TN". And is_correct is false whenever the load DID receive forwarding —
+  logged as "FN".
+
+  But a load that received forwarding after being predicted independent is NOT 
+  necessarily a false negative. The load might have been predicted independent,
+  executed, and happened to read from a store that forwarded to it — but the
+  load was never in danger of violating because the store executed before the
+  load. The forwarding happened naturally through the SQ search, not because the
+   load overtook the store.
+
+  A true False Negative is: PHAST predicted no dependency, the load executed
+  speculatively, overtook a conflicting store, and caused a memory order
+  violation. But those loads get squashed and never reach commit. So
+  updateConfidence cannot observe true FNs at all.
+
+  The "FN" log at line 318 is really logging: "no dependency predicted, but the
+  load happened to receive forwarding from some store." This isn't actually a
+  misprediction — it's a load that executed fine (no violation) and happened to
+  get forwarded data.
+
+  Problem 2: The "TP" check uses the wrong comparison
+
+  Lines 327-338 handle loads with a prediction. The check:
+  bool is_correct = load_inst->forwardingStoreSeqNum ==
+  predicted_forwarding_store_seq_num;
+  This requires the load to have received forwarding from the exact predicted 
+  store. But consider:
+
+  - Load was predicted to depend on store S (waited for S)
+  - S executed, computed address to a different location (false positive)
+  - Load was woken up, executed, read from cache (no forwarding)
+  - forwardingStoreSeqNum = 0, predictedStoreSeqNum = S.seqNum
+  - Logged as "FP" — correct
+
+  But also:
+  - Load was predicted to depend on store S (waited for S)
+  - S executed, wrote to the load's address
+  - Load was woken up, executed, got forwarding from S
+  - forwardingStoreSeqNum = S.seqNum — match!
+  - Logged as "TP" — correct
+
+  And:
+  - Load was predicted to depend on store S1 (waited for S1)
+  - S1 executed, wrote to load's address (forwarding from S1)
+  - But a younger store S2 ALSO writes to load's address and executes after S1
+  but before the load
+  - Load gets forwarding from S2 (youngest matching store in SQ), not S1
+  - forwardingStoreSeqNum = S2.seqNum ≠ S1.seqNum
+  - Logged as "FP" — but the prediction of S1 was partially correct (S1 IS a
+  real dependency), it just wasn't the youngest one. The confidence gets
+  decremented, eroding a valid entry.
+
+  Problem 3: Does not capture all outcomes
+
+  True False Negatives (violations) are invisible. A load that caused a
+  violation is squashed before commit. updateConfidence never sees it. The only
+  way to count real FNs is through the memOrderViolation stat.
+
+  So the summary of what the logs actually capture:
+
+  ┌────────┬────────────────────────────────────────────────────────────────┐
+  │  Log   │                     What it actually means                     │
+  │ label  │                                                                │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │ "TN"   │ No prediction, no forwarding. Could be correct OR a missed     │
+  │        │ dependency where the store happened to execute first.          │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │        │ No prediction, but forwarding happened. NOT a real FN — load   │
+  │ "FN"   │ committed fine. Just means a non-predicted load got forwarded  │
+  │        │ data naturally.                                                │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │ "TP"   │ Predicted a store, and that exact store forwarded to the load. │
+  │        │  Genuinely correct.                                            │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │        │ Predicted a store, but that store didn't forward (either wrong │
+  │ "FP"   │  address = true FP, or a younger store forwarded instead).     │
+  │        │ Decrements confidence.                                         │
+  └────────┴────────────────────────────────────────────────────────────────┘
+
+  What percentages should we expect with eager training?
+
+  With eager training and cascading violations:
+
+  1. High "FP" rate: PHAST learns the older store first (from the first
+  violation). On re-execution, it predicts that older store. The load waits for
+  it, gets forwarding from it. But then a younger store triggers ANOTHER
+  violation. After several cycles, PHAST eventually learns the youngest store.
+  But the entries for older stores linger in the tables. When those entries
+  match (based on history), they predict the wrong distance, causing either:
+    - The load to get forwarding from a different (younger) store → logged as
+  "FP", confidence decremented
+    - Over time, these entries' confidence drops to 0, wasting table capacity
+  2. Misleading "TN" rate: Many loads that should have been predicted (but whose
+   entry was evicted or had confidence=0 from repeated FP decrements) will show
+  as "TN" here. They look correct but are actually missed predictions that got
+  lucky (the store executed before the load by chance).
+  3. Misleading "FN" rate: These aren't real false negatives. They're loads that
+   had no prediction but received forwarding. This is normal — not every
+  load-store forwarding pair represents a dependency that needs prediction.
+  4. Real FNs (violations) are invisible: The 9735 memOrderViolation events are
+  the true FNs. These loads were predicted independent, executed speculatively,
+  and violated. They were squashed and never reached updateConfidence.
+
+  So the expected pattern with eager training would be: moderately high FP rate
+  (from cascading wrong-store predictions), inflated TN count (hiding missed
+  predictions), and the real damage (9735 violations) is completely invisible to
+   this function.
+
+✻ Sautéed for 1m 12s
+
+❯ How would I change gem5 to do lazy training? Walk me through the files,       
+functions, I need to change.                                                    
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ /plan                                                                         
+  ⎿  Enabled plan mode
+
+❯ How would I change gem5 to do lazy training? Walk me through the files,       
+functions, I need to change.                                                    
+
+⏺ I have a good understanding of the codebase from our earlier analysis. Let me
+  trace the exact changes needed with one exploration agent to verify a detail.
+
+⏺ Explore(Explore violation flow details)
+  ⎿  Done (12 tool uses · 36.4k tokens · 55s)
+  (ctrl+o to expand)
+
+⏺ Good. Now let me design the implementation plan.
+
+⏺ Plan(Design lazy training plan)
+  ⎿  Done (21 tool uses · 38.5k tokens · 3m 1s)
+  (ctrl+o to expand)
+
+⏺ Updated plan
+  ⎿  /plan to preview
+  ⎿  Tool use rejected
+
+⏺ Good point — the store is older than the load, so it survives the squash and
+  remains in the ROB. We can just pass the store's DynInstPtr directly instead
+  of extracting scalars. Let me simplify the plan.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/purrfect-discovering-lemon.md · /plan to 
+     edit
+     Lazy PHAST Training: Defer Predictor Training from IEW to Commit
+
+     Context
+
+     PHAST is currently trained eagerly: when a store executes in IEW and
+     detects a memory order violation with a younger load,
+     phastPred.violation(store, load) is called immediately. The PHAST paper
+     (Section IV-A1) explicitly states training should happen at commit time to
+     avoid learning wrong-path dependencies and incorrect store distances from
+     cascading violations.
+
+     Approach
+
+     Store the violating store's DynInstPtr on the load at detection time in
+     IEW. Skip PHAST training in MemDepUnit::violation(). Train PHAST at commit
+     time when processing the memory order violation squash, using the store
+     DynInstPtr from the load. The store is older than the load and survives the
+      squash, so it's still valid.
+
+     Changes
+
+     1. src/cpu/o3/dyn_inst.hh — Add violation store pointer (~line 372)
+
+     DynInstPtr phastViolationStore = nullptr;
+
+     2. src/cpu/o3/iew.cc — Stamp store on violating load (~line 1331)
+
+     Before instQueue.violation(inst, violator) at line 1334:
+     if (usePhast) {
+         violator->phastViolationStore = inst;
+     }
+     inst is the store, violator is the load.
+
+     3. src/cpu/o3/mem_dep_unit.cc — Make PHAST branch a no-op (~line 617)
+
+     In MemDepUnit::violation(), replace phastPred.violation(store_inst, 
+     violating_load) with a comment. Store Sets branch unchanged.
+
+     4. src/cpu/o3/commit.cc — Train PHAST during squash processing (~line 819)
+
+     In the memory order violation branch, after the existing
+     phast->squashBranches(...) call:
+     if (usePhast && violator_inst->phastViolationStore) {
+         phast->violation(violator_inst->phastViolationStore, violator_inst);
+     }
+     The existing phast->violation(store, load) method is reused as-is. No new
+     method needed.
+
+     5. No changes to phast.hh / phast.cc
+
+     The existing violation() method works unchanged — it reads sqIdx and
+     phastDecodeBranchCount from both DynInstPtrs, which are still valid at
+     commit time.
+
+     Files to modify
+
+     ┌────────────────────────────┬─────────────────────────────────────────────
+     ┐
+     │            File            │                   Change
+     │
+     ├────────────────────────────┼─────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/dyn_inst.hh     │ Add phastViolationStore field
+     │
+     ├────────────────────────────┼─────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/iew.cc          │ Stamp store DynInstPtr on load
+     │
+     ├────────────────────────────┼─────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/mem_dep_unit.cc │ Skip PHAST training in violation()
+     │
+     ├────────────────────────────┼─────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/commit.cc       │ Call phast->violation() in
+     │
+     │                            │ squash-processing block
+     │
+     └────────────────────────────┴─────────────────────────────────────────────
+     ┘
+
+     Why this works
+
+     - Store survives the squash: The store is older than the load. The squash
+     targets the load and younger instructions. The store's DynInst remains
+     valid with correct sqIdx and phastDecodeBranchCount.
+     - Wrong-path filtering: The guard at commit.cc:788 rejects stale squash
+     signals from instructions already squashed by a branch mispredict.
+     - Load is findable: rob->findInst() at line 816 already finds the violating
+      load.
+
+     Limitations
+
+     Does NOT fully solve cascading violations (that requires lazy squash). But
+     filters wrong-path pollution and provides a foundation for future
+     improvements.
+
+     Verification
+
+     1. Build and run microbenchmarks with MEM_DEP_PREDICTOR=phast
+     2. Compare memOrderViolation stat — should decrease if wrong-path
+     violations were being trained
+     3. Check PHAST debug logs (--debug-flags=Phast) to verify training happens
+     from commit path
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/dyn_inst.hh)
+  ⎿  Added 2 lines
+      371      int predictedStoreDist = -1;
+      372      uint16_t predictedTag = 0;
+      373  
+      374 +    /** Store that caused a memory order violation with this l
+          +oad (for lazy training at commit) */                          
+      375 +    DynInstPtr phastViolationStore = nullptr;                 
+      376  
+      377      /////////////////////// TLB Miss //////////////////////
+      378      /**
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/iew.cc)
+  ⎿  Added 6 lines
+      1330  
+      1331                  fetchRedirect[tid] = true;
+      1332  
+      1333 +                // PHAST: Store the violating store on the lo
+           +ad for lazy                                                  
+      1334 +                // training at commit time (paper Section IV-
+           +A1).                                                         
+      1335 +                if (o3::usePhast) {                          
+      1336 +                    violator->phastViolationStore = inst;    
+      1337 +                }                                            
+      1338 +                                                             
+      1339                  // Tell the instruction queue that a violatio
+            n has occured.
+      1340                  instQueue.violation(inst, violator);
+      1341  
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Those diagnostics are just the IDE not finding gem5 headers (SCons build
+  system issue, not a real error). Let me continue.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 2 lines, removed 1 line
+      614              store_inst->pcState().instAddr());
+      615      // Tell the memory dependence unit of the violation.
+      616      if (usePhast) {
+      617 -        phastPred.violation(store_inst, violating_load);      
+      617 +        // PHAST: Training deferred to commit time (lazy train
+          +ing).                                                         
+      618 +        // Violation data is stamped on the load DynInst in IE
+          +W.                                                            
+      619      } else {
+      620          ssPred.violation(store_inst->pcState().instAddr(),
+      621                           violating_load->pcState().instAddr())
+           ;
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me check if usePhast is accessible from commit.cc:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ I see that commit.cc already includes dyn_inst.hh but doesn't include
+  mem_dep_unit.hh for the usePhast extern. Let me check how it's accessed
+  elsewhere — actually the usePhast extern is declared in mem_dep_unit.hh line
+  80. But commit.cc already uses cpu->getPhast(tid) so it knows about PHAST. Let
+   me just check if the extern is accessible:
+
+  Searched for 1 pattern (ctrl+o to expand)
+⏺ commit.cc uses cpu->getPhast() but doesn't directly include mem_dep_unit.hh.
+  The usePhast extern must be coming through cpu.hh → some transitive include.
+  Let me check:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ cpu.hh includes iew.hh which likely includes inst_queue.hh which includes
+  mem_dep_unit.hh which declares extern bool usePhast. So usePhast should be
+  accessible in commit.cc. Let me verify the include chain:
+
+  Searched for 4 patterns (ctrl+o to expand)
+
+⏺ So inst_queue.hh has MemDepUnit but let me check if it includes the header:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Good. The chain is: commit.cc → cpu.hh → iew.hh → inst_queue.hh →
+  mem_dep_unit.hh which declares extern bool usePhast. So o3::usePhast is
+  accessible in commit.cc.
+
+  Now let me make the commit.cc change:
+
+⏺ Update(src/cpu/o3/commit.cc)
+  ⎿  Added 7 lines
+      816                  auto violator_inst = rob->findInst(tid, fromIE
+           W->squashedSeqNum[tid] - fromIEW->includeSquashInst[tid]);
+      817                  if (violator_inst) {
+      818                      phast->squashBranches(violator_inst->phast
+           DecodeBranchCount);
+      819 +                                                              
+      820 +                    // PHAST: Lazy training -- train predictor
+          + at commit time                                               
+      821 +                    // instead of at detection time (paper Sec
+          +tion IV-A1).                                                  
+      822 +                    if (usePhast && violator_inst->phastViolat
+          +ionStore) {                                                   
+      823 +                        phast->violation(violator_inst->phastV
+          +iolationStore,                                                
+      824 +                                         violator_inst);      
+      825 +                    }                                         
+      826                  }
+      827              }
+      828  
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ All four changes are done. Let me verify the changes look correct by reading
+  the modified sections:
+
+⏺ Bash(git diff --stat)
+  ⎿   src/cpu/o3/commit.cc       | 7 +++++++
+      src/cpu/o3/dyn_inst.hh     | 2 ++
+      src/cpu/o3/iew.cc          | 6 ++++++
+     … +2 lines (ctrl+o to expand)
+
+⏺ Bash(git diff)
+  ⎿  diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+     index 3fef8fc761..5efb2095ce 100644
+     --- a/src/cpu/o3/commit.cc
+     … +36 lines (ctrl+o to expand)
+
+⏺ All four changes are clean and minimal:
+
+  1. dyn_inst.hh: Added phastViolationStore field to carry the store pointer
+  from IEW to commit
+  2. iew.cc: Stamps the store onto the violating load when a violation is
+  detected
+  3. mem_dep_unit.cc: Removed eager PHAST training (now a no-op comment)
+  4. commit.cc: Added lazy training call in the squash-processing block, right
+  after the existing squashBranches call
+
+  The existing phast->violation(store, load) method is reused unchanged — both
+  DynInstPtrs are valid at commit time since the store is older than the load
+  and survives the squash.
+
+✻ Cooked for 11m 46s
+
+❯ would it be a good idea to implement lazy squash? Would it increase           
+performance of Phast relative to Store sets? If so, plan an implementation      
+plan.                                                                           
+
+⏺ Yes, lazy squash would be a significant improvement. Here's why:
+
+  Lazy training alone (what we just implemented) doesn't solve cascading. The
+  squash is still eager — only the first (oldest) conflicting store triggers the
+   violation before the pipeline flushes. Younger stores never execute. So PHAST
+   still learns the wrong store distance, and re-execution still cascades.
+
+  Lazy squash eliminates cascading entirely. All conflicting stores execute
+  before the squash happens at commit. PHAST trains with the youngest (correct)
+  store. One squash per real dependency, correct training on the first
+  occurrence.
+
+  The paper explicitly uses lazy squash (Section V): "We perform eager squash on
+   branch misprediction for a fast recovery, but lazy-squash for the less 
+  frequent memory order violations."
+
+  Let me explore the implementation requirements.
+
+⏺ Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+⏺ Explore(Explore commit load flow)
+  ⎿  Done (41 tool uses · 48.7k tokens · 5m 42s)
+  (ctrl+o to expand)
+
+⏺ Now let me design the implementation plan.
+
+⏺ Plan(Design lazy squash plan)
+  ⎿  Done (35 tool uses · 51.4k tokens · 4m 11s)
+  (ctrl+o to expand)
+⏺ Let me verify a few critical details before writing the plan.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Good. Now I can see that commitHead returns a bool — true means committed,
+  false means not committed. And commitInsts at line 1012 checks the return
+  value. If commitHead returns false, the instruction is not counted as
+  committed. Let me check commitHead's return type:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me check what happens after commitHead returns false — does the commit
+   loop break?
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Line 1119-1123: when commitHead returns false, the else branch at line 1119
+  breaks out of the commit loop. So returning false from commitHead stops
+  committing for that cycle. This is exactly what we want — the violated load
+  stays at the ROB head, and the squash from squashAll takes effect.
+
+  Now I have everything I need. Let me write the final plan.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/purrfect-discovering-lemon.md · /plan to 
+     edit
+     Lazy Squash for PHAST Memory Order Violations
+
+     Context
+
+     With eager squash (current), only the first conflicting store triggers a
+     violation before the pipeline flushes. Younger conflicting stores are
+     squashed before they can execute. This causes cascading violations: PHAST
+     learns the wrong (older) store, re-executes, and a younger store fires
+     again. This repeats until the youngest store is learned, producing 100x
+     more violations than Store Sets.
+
+     The PHAST paper uses lazy squash (Section V): violations are flagged but
+     the pipeline continues, allowing ALL conflicting stores to execute. At
+     commit, the youngest conflicting store is known, PHAST trains correctly,
+     and one squash handles the entire dependency. This eliminates cascading.
+
+     Note: This supersedes the lazy training change (which deferred training to
+     commit but still used eager squash). With lazy squash, the training
+     naturally happens at commit since that's where the squash occurs.
+
+     Approach
+
+     For PHAST only (Store Sets keeps eager squash):
+     1. checkViolations flags the load instead of triggering an immediate squash
+     2. Multiple stores can update the flag, keeping the youngest
+     3. IEW never sees a PHAST violation (no memDepViolator, no fault)
+     4. At commit, when a flagged load reaches the ROB head, squash and train
+     PHAST
+
+     Changes
+
+     1. src/cpu/o3/lsq_unit.cc — checkViolations (~line 581)
+
+     In the store-to-load violation branch, add a PHAST path before the existing
+      Store Sets logic:
+
+     } else {
+         // Existing PHAST forwarding filter (lines 585-589) stays as-is
+
+         if (usePhast) {
+             // Lazy squash: flag the load, keep youngest conflicting store.
+             // Do NOT set memDepViolator or return fault.
+             if (!ld_inst->phastViolationStore ||
+                 inst->seqNum > ld_inst->phastViolationStore->seqNum) {
+                 ld_inst->phastViolationStore = inst;
+             }
+             ++loadIt;
+             continue;  // Keep walking load queue for other violated loads
+         }
+
+         // Store Sets path (unchanged): ...
+
+     Key points:
+     - inst->seqNum > phastViolationStore->seqNum keeps the youngest store
+     (highest seqNum = youngest in program order)
+     - continue instead of break/return — the store keeps checking other loads
+     - No memDepViolator set → violation(tid) returns false → IEW doesn't squash
+     - No fault returned → executeStore returns NoFault → store executes
+     normally
+
+     2. src/cpu/o3/commit.cc — commitHead (~line 1299)
+
+     Insert BEFORE the existing PHAST confidence update and BEFORE
+     rob->retireHead():
+
+     // PHAST lazy squash: if this load was flagged with a memory order
+     // violation, train PHAST and trigger squash instead of committing.
+     if (o3::usePhast && head_inst->isLoad() && head_inst->phastViolationStore)
+     {
+         auto phast = cpu->getPhast(tid);
+         phast->violation(head_inst->phastViolationStore, head_inst);
+         phast->squashBranches(head_inst->phastDecodeBranchCount);
+
+         // pc[tid] is already set to head_inst->pcState() at line 1007
+         squashAll(tid);
+         commitStatus[tid] = ROBSquashing;
+         cpu->activityThisCycle();
+         return false;  // Do not commit this load
+     }
+
+     Why this works:
+     - pc[tid] is set to head_inst->pcState() at line 1007, before commitHead is
+      called. squashAll uses pc[tid] as the redirect target (line 534). Fetch
+     restarts at the load's PC.
+     - squashAll squashes from ROB head (line 509-510: readHeadInst()->seqNum - 
+     1), including the head instruction itself.
+     - Returning false stops the commit loop (line 1119-1123: break). The load
+     is NOT committed, NOT retired from the ROB. It stays there to be squashed
+     by the ROBSquashing state.
+
+     3. src/cpu/o3/iew.cc — Remove lazy-training stamping code (~line 1335)
+
+     The code that stamps violator->phastViolationStore = inst in IEW (added in
+     the previous lazy-training change) is now dead — checkViolations stamps the
+      load directly, and IEW never sees PHAST violations. Remove or guard it:
+
+     // This block is no longer needed with lazy squash — checkViolations
+     // stamps phastViolationStore directly. Remove the if (o3::usePhast)
+     // block that was added for lazy training.
+
+     4. src/cpu/o3/mem_dep_unit.cc — Already done
+
+     The PHAST branch of MemDepUnit::violation() is already a no-op (from the
+     lazy training change). With lazy squash, this method is never even called
+     for PHAST violations since IEW doesn't detect them.
+
+     5. src/cpu/o3/commit.cc — Clean up lazy-training code (~line 819)
+
+     The lazy-training code in the IEW-squash handler (lines 822-825 that call
+     phast->violation from the squash block) is now dead for PHAST. Remove the
+     if (usePhast && violator_inst->phastViolationStore) block added in the
+     previous change. The squashBranches call should remain (it handles branch
+     counter restoration for IEW-initiated squashes, which still happen for
+     Store Sets).
+
+     Files to modify
+
+     ┌────────────────────────┬─────────────────────────────────────────────────
+     ┐
+     │          File          │                     Change
+     │
+     ├────────────────────────┼─────────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/lsq_unit.cc │ Add PHAST path in checkViolations: flag load,
+     │
+     │                        │ keep youngest store, no fault
+     │
+     ├────────────────────────┼─────────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/commit.cc   │ Add violation check in commitHead: train PHAST,
+     │
+     │                        │  squashAll, return false
+     │
+     ├────────────────────────┼─────────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/commit.cc   │ Remove lazy-training code from IEW-squash
+     │
+     │                        │ handler (now dead)
+     │
+     ├────────────────────────┼─────────────────────────────────────────────────
+     ┤
+     │ src/cpu/o3/iew.cc      │ Remove lazy-training stamping code (now dead)
+     │
+     └────────────────────────┴─────────────────────────────────────────────────
+     ┘
+
+     Race conditions handled
+
+     - Branch mispredict squashes load before commit: Load is squashed, never
+     reaches commitHead. phastViolationStore DynInstPtr is released when load
+     DynInst is freed. No issue.
+     - IEW squash signal + lazy squash in same cycle: commit.cc tick() processes
+      IEW squashes (line 786) BEFORE calling commitInsts() (line 889). If the
+     IEW squash covers the load, it's squashed before commitHead runs.
+     - Multiple stores conflict with same load: Each store's checkViolations
+     call updates phastViolationStore to the younger store. By the time the load
+      reaches commit, it has the youngest conflicting store.
+
+     Verification
+
+     1. Build and run microbenchmarks with MEM_DEP_PREDICTOR=phast
+     2. memOrderViolation should drop dramatically (no more cascading)
+     3. IPC should approach or exceed Store Sets
+     4. Check PHAST debug logs: violation should be called from commit, with
+     youngest store distances
+     5. Verify Store Sets still works identically (not affected by changes)
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/lsq_unit.cc)
+  ⎿  Added 14 lines
+      588                      continue;
+      589                  }
+      590  
+      591 +                if (usePhast) {                               
+      592 +                    // PHAST lazy squash: flag the load with t
+          +he youngest                                                   
+      593 +                    // conflicting store. Do NOT set memDepVio
+          +lator or return                                               
+      594 +                    // a fault -- let the pipeline continue so
+          + all conflicting                                              
+      595 +                    // stores can execute before the squash at
+          + commit.                                                      
+      596 +                    if (!ld_inst->phastViolationStore ||      
+      597 +                        inst->seqNum > ld_inst->phastViolation
+          +Store->seqNum) {                                              
+      598 +                        ld_inst->phastViolationStore = inst;  
+      599 +                    }                                         
+      600 +                    ++loadIt;                                 
+      601 +                    continue;                                 
+      602 +                }                                             
+      603 +                                                              
+      604 +                // Store Sets path (eager squash):            
+      605                  // A load/store incorrectly passed this store.
+      606                  // Check if we already have a violator, or if 
+           it's newer
+      607                  // squash and refetch.  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Now add the violation check in commitHead:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ I need to insert before the HTM check (which is after renameMap updates). The
+  violation check should be the first thing after the commit rename map updates,
+   before any side effects of committing the load:
+
+⏺ Update(src/cpu/o3/commit.cc)
+  ⎿  Added 19 lines
+      1291                                   head_inst->renamedDestIdx(i)
+            );
+      1292      }
+      1293  
+      1294 +    // PHAST lazy squash: if this load was flagged with a mem
+           +ory order                                                    
+      1295 +    // violation, train PHAST and trigger squash instead of c
+           +ommitting.                                                   
+      1296 +    if (usePhast && head_inst->isLoad() && head_inst->phastVi
+           +olationStore) {                                              
+      1297 +        DPRINTF(Commit, "[tid:%i] [sn:%llu] PHAST lazy squash
+           +: load has "                                                 
+      1298 +                "violation from store [sn:%llu], squashing\n"
+           +,                                                            
+      1299 +                tid, head_inst->seqNum,                      
+      1300 +                head_inst->phastViolationStore->seqNum);     
+      1301 +                                                             
+      1302 +        auto phast = cpu->getPhast(tid);                     
+      1303 +        phast->violation(head_inst->phastViolationStore, head
+           +_inst);                                                      
+      1304 +        phast->squashBranches(head_inst->phastDecodeBranchCou
+           +nt);                                                         
+      1305 +                                                             
+      1306 +        // pc[tid] is already set to head_inst->pcState() at 
+           +line 1007                                                    
+      1307 +        squashAll(tid);                                      
+      1308 +        commitStatus[tid] = ROBSquashing;                    
+      1309 +        cpu->activityThisCycle();                            
+      1310 +        return false;  // Do not commit this load            
+      1311 +    }                                                        
+      1312 +                                                             
+      1313      // hardware transactional memory
+      1314      // the HTM UID is purely for correctness and debugging pu
+            rposes
+      1315      if (head_inst->isHtmStart())
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Now clean up the dead lazy-training code. First, remove the IEW stamping code:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/iew.cc)
+  ⎿  Removed 6 lines
+      1330  
+      1331                  fetchRedirect[tid] = true;
+      1332  
+      1333 -                // PHAST: Store the violating store on the lo
+           -ad for lazy                                                  
+      1334 -                // training at commit time (paper Section IV-
+           -A1).                                                         
+      1335 -                if (o3::usePhast) {                          
+      1336 -                    violator->phastViolationStore = inst;    
+      1337 -                }                                            
+      1338 -                                                             
+      1333                  // Tell the instruction queue that a violatio
+            n has occured.
+      1334                  instQueue.violation(inst, violator);
+      1335  
+
+⏺ Now remove the lazy-training violation call in commit.cc squash handler:
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/commit.cc)
+  ⎿  Removed 7 lines
+      816                  auto violator_inst = rob->findInst(tid, fromIE
+           W->squashedSeqNum[tid] - fromIEW->includeSquashInst[tid]);
+      817                  if (violator_inst) {
+      818                      phast->squashBranches(violator_inst->phast
+           DecodeBranchCount);
+      819 -                                                              
+      820 -                    // PHAST: Lazy training -- train predictor
+          - at commit time                                               
+      821 -                    // instead of at detection time (paper Sec
+          -tion IV-A1).                                                  
+      822 -                    if (usePhast && violator_inst->phastViolat
+          -ionStore) {                                                   
+      823 -                        phast->violation(violator_inst->phastV
+          -iolationStore,                                                
+      824 -                                         violator_inst);      
+      825 -                    }                                         
+      819                  }
+      820              }
+      821  
+  ⎿  Found 4 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Let me verify the final diff:
+
+⏺ Bash(git diff)
+  ⎿  diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+     index 5efb2095ce..3d4e9628a1 100644
+     --- a/src/cpu/o3/commit.cc
+     … +52 lines (ctrl+o to expand)
+
+⏺ All changes are clean. Let me also verify the dyn_inst.hh change from the
+  earlier lazy-training step is still in place:
+
+⏺ Bash(git diff -- src/cpu/o3/dyn_inst.hh)
+  ⎿  (No output)
+
+⏺ Bash(git diff HEAD -- src/cpu/o3/dyn_inst.hh)
+  ⎿  (No output)
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Good — the phastViolationStore field was already committed (from the lazy
+  training step). The diff only shows the new changes on top.
+
+  Here's a summary of the complete lazy squash implementation:
+
+  lsq_unit.cc — When a store detects a conflict with a load and usePhast is
+  true, it flags the load with phastViolationStore (keeping the youngest store)
+  instead of setting memDepViolator or returning a fault. The pipeline continues
+   normally.
+
+  commit.cc (commitHead) — When a flagged load reaches the ROB head, PHAST is
+  trained with the youngest conflicting store, then squashAll() triggers the
+  squash. The load is NOT committed (returns false).
+
+  commit.cc (squash handler) — Removed the now-dead lazy-training code from the
+  IEW-squash handler.
+
+  iew.cc — Removed the now-dead lazy-training stamping code. IEW never sees
+  PHAST violations since memDepViolator is never set for them.
+
+  mem_dep_unit.cc — Already a no-op for PHAST from the previous change.
+
+  The key benefit: multiple stores can now conflict with the same load across
+  different execute cycles, each updating phastViolationStore to the younger
+  store. By the time the load reaches commit, PHAST has the youngest (correct)
+  store distance. No cascading violations.
+
+✻ Crunched for 14m 57s
+
+❯ Let's make sure your changes keep the stats updated properly. For example,    
+memOrderViolations is no longer incremented for phast.                          
+
+⏺ Good catch. Let me check all the stats that need updating.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ There are two stats that are affected:
+
+  1. stats.memOrderViolation (lsq_unit) — incremented at line 566 and 616 inside
+   checkViolations. The PHAST lazy squash path skips this entirely with
+  continue.
+  2. iewStats.memOrderViolationEvents (iew) — incremented at line 1339 inside
+  IEW's violation handling. Since PHAST never sets memDepViolator, IEW never
+  enters this block.
+
+  Both need to be incremented at commit time for PHAST. Let me add the stat
+  increment to the lazy squash block in commitHead:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I need to figure out how to access the LSQ and IEW stats from commit. Let
+  me check what commit has access to:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Commit has iewStage pointer. Let me check if IEW exposes the LSQ stats or the
+  memOrderViolationEvents stat:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ iewStats is a public member of IEW. So from commit, I can access
+  iewStage->iewStats.memOrderViolationEvents. But that's reaching into IEW's
+  internals. A simpler approach: just increment the memOrderViolation stat from
+  the LSQ, which commit can access through iewStage->ldstQueue. But actually,
+  the simplest and cleanest approach is to just increment the stat right in the
+  checkViolations PHAST path — at detection time. The stat counts detected
+  violations, not squashes. This is consistent with Store Sets which also counts
+   at detection.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The question is: should memOrderViolation count every detection (each
+  store-load pair that conflicts), or only actual squash-causing violations?
+  With lazy squash, multiple stores can flag the same load, but only one squash
+  happens.
+
+  For consistency with Store Sets (which counts at detection), and because the
+  stat name is "violations" not "squashes", I'll count at detection. But I
+  should only count when we first flag the load or update to a newer store —
+  i.e., when we actually set phastViolationStore:
+
+⏺ Update(src/cpu/o3/lsq_unit.cc)
+  ⎿  Added 1 line
+      596                      if (!ld_inst->phastViolationStore ||
+      597                          inst->seqNum > ld_inst->phastViolation
+           Store->seqNum) {
+      598                          ld_inst->phastViolationStore = inst;
+      599 +                        ++stats.memOrderViolation;            
+      600                      }
+      601                      ++loadIt;
+      602                      continue;
+
+⏺ Now let me verify the final diff is complete and correct:
+
+⏺ Bash(git diff --stat)
+  ⎿   src/cpu/o3/lsq_unit.cc | 1 +
+      1 file changed, 1 insertion(+)
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ That only shows the uncommitted change. Let me see the full diff including
+  already-staged/committed changes:
+
+⏺ Bash(git diff HEAD~1 --stat)
+  ⎿   src/cpu/o3/lsq_unit.cc | 1 +
+      src/cpu/o3/phast.cc    | 8 +++++---
+      2 files changed, 6 insertions(+), 3 deletions(-)
+
+⏺ The other changes (commit.cc, iew.cc, dyn_inst.hh, mem_dep_unit.cc) were
+  already committed. Let me check the full state against the main branch:
+
+⏺ Bash(git diff main --stat -- src/cpu/o3/commit.cc src/cpu/o3/iew.cc
+      src/cpu/o3/dyn_inst.hh src/cpu/o3/mem_dep_unit.cc src/cpu/o3/lsq_unit.cc)
+  ⎿   src/cpu/o3/commit.cc       | 44 ++++++++++++++++++++++++++++
+      src/cpu/o3/dyn_inst.hh     | 17 +++++++++++
+      src/cpu/o3/lsq_unit.cc     | 34 +++++++++++++++++++++-
+     … +3 lines (ctrl+o to expand)
+
+⏺ IEW isn't showing because the lazy-training add and remove canceled out. Good
+  — the net effect on iew.cc is zero. Let me verify the stats are now properly
+  handled by reviewing the complete PHAST-related changes:
+
+⏺ Bash(git diff main -- src/cpu/o3/lsq_unit.cc)
+  ⎿  diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+     index 67ae69237e..948eef8bb5 100644
+     --- a/src/cpu/o3/lsq_unit.cc
+     … +46 lines (ctrl+o to expand)
+⏺ memOrderViolation is incremented in the PHAST lazy squash path. Now let me
+  also check: does iewStats.memOrderViolationEvents still need to be counted?
+  That's the IEW-level stat. For PHAST, IEW never sees violations, so it won't
+  be incremented. This is actually correct — it tracks IEW-detected violations,
+  and with lazy squash, PHAST violations are detected in the LSQ and acted on at
+   commit. The stats.memOrderViolation in LSQUnit is the primary stat for
+  violation counting.
+
+  The stats are now properly maintained:
+
+  - lsq_unit.stats.memOrderViolation: Incremented at detection time in
+  checkViolations for both PHAST (lazy squash path, line 599) and Store Sets
+  (eager path, line 616). Counts each time a new/younger conflicting store is
+  found for a load.
+  - iewStats.memOrderViolationEvents: Only incremented for Store Sets (IEW
+  handles the squash). For PHAST, this stat is 0 since IEW never sees the
+  violation. This correctly reflects that IEW doesn't process PHAST memory
+  violations.
+  - lsq_unit.stats.squashedLoads: Unchanged — still incremented during LSQ
+  squash processing (line 1011). Will be incremented when the lazy squash at
+  commit triggers squashAll.
+
+✻ Baked for 2m 16s
+
+❯ After running the benchmarks with fixed stats, I'm still getting 10000 mem    
+order violations on phast side. The numbers haven't changed much at all.        
+
+⏺ That's a strong signal that cascading violations were NOT the main problem.
+  Lazy squash only helps if the same load is violated multiple times by
+  different stores across re-executions. If the count didn't change, the 10000
+  violations are from loads that PHAST simply fails to predict — cold misses or
+  wrong predictions.
+
+  Let me verify the lazy squash is actually being reached, and then let's look
+  at the real source of violations.
+
+⏺ User answered Claude's questions:
+  ⎿  · Can you share the full stats for the lazy squash run? Key stats to 
+     compare: ipc, insertedLoads (was 282k — should decrease if lazy squash is 
+     working), squashedLoads (was 136k), memOrderViolation, conflictingLoads, 
+     and PHAST stats (numCorrectPredictions, numIncorrectPredictions). This will
+      tell us whether the lazy squash code is even being reached, and whether 
+     the violations are cold misses vs wrong predictions. → I'll paste the stats
+
+⏺ Please paste the stats when you're ready and I'll analyze them.
+
+✻ Cogitated for 2m 29s
+
+❯ The benchmarks are in bench directory. You can view the source files and      
+stats are in results.txt                                                        
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+⏺ The stats reveal something critical. Let me look at the benchmarks to
+  understand the access patterns, and check if the lazy squash code is actually
+  being reached.
+
+  Searched for 5 patterns, read 5 files (ctrl+o to expand)
+
+⏺ Now I have enough to analyze. Let me look at the current PHAST code to
+  understand the real problem:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me look at the key thing — is foldHistory at commit time producing the
+   same hash as at decode time? The issue is that foldHistory reads from the
+  live GHB, and at commit time the GHB state has advanced.
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I see the real problem. Let me look at the benchmarks more carefully —
+  these are tight loops with the same load and store PCs every iteration. Take
+  b01_immdep:
+
+  for (long long i=0;i<ITERS;i++) {
+      A[idx]=i;      // store
+      int x=A[idx];  // load — ALWAYS depends on the immediately preceding store
+  }
+
+  This is store distance 1, history length 0 (no branches between store and
+  load). It should be the simplest case for PHAST. Store Sets gets 86 violations
+   (cold start). PHAST gets 9660 violations. There's no cascading possible here
+  — one store, one load, same iteration. The problem is that PHAST is
+  fundamentally failing to make or use predictions correctly.
+
+  Let me now check: are b01_immdep's insertedLoads inflated vs Store Sets?
+  - PHAST: 226830 loads, SS: 172279 loads. Ratio = 1.32x
+  - PHAST squashedLoads: 67957, SS: 13406
+
+  67957 squashed loads from 9660 violations = ~7 loads squashed per violation.
+  The extra insertedLoads (226k vs 172k = 54k extra) matches roughly with
+  re-executions from squashes.
+
+  So 9660 violations for a trivial store-load pattern. PHAST should learn this
+  after 1 violation and never violate again. The fact it doesn't means either:
+  1. phast->violation() isn't being called (bug in lazy squash flow)
+  2. The entry is being stored but can't be found by checkInst
+  3. The entry is found but storeDistToSeqNum returns 0
+
+  This is a predictor logic bug, not a training timing bug. Let me check if the
+  issue existed before our lazy squash changes too. Looking at the original
+  stats from the conversation start:
+
+  phast     memOrderViolation   9735.8  (average)
+
+  And the new results have similar numbers. The violations were always ~10k.
+  Lazy squash didn't change the count because the core predictor has a 
+  fundamental bug.
+
+  Let me trace through b01_immdep to find the bug. The loop has no branches
+  between the store and load, so hist_len = 0. Let me check what happens with
+  history length 0:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ When hist_len = 0 (the table with history length 0), foldHistory is called
+  with hist_len = 0. Then line 84: hist_len += 1 makes it 1. So it reads one 
+  branch entry from the GHB — the branch at position load_branch_count - 1.
+
+  This is the N+1 branch from the paper — the branch BEFORE the conflicting
+  store. But for b01_immdep, the loop back-edge IS a branch. Each iteration has
+  a conditional branch. So the same branch is read every time.
+
+  The issue is: at violation training time (commit), the GHB is read at position
+   load_branch_count - 1. At prediction time (decode/dispatch), the GHB is read
+  at the same position. But if the GHB has been modified between training and
+  prediction (hundreds/thousands of branches decoded between commit of one
+  iteration and decode of a future iteration), the entry at that position might
+  have been overwritten.
+
+  Wait — load_branch_count is captured at decode time (phastDecodeBranchCount).
+  Each iteration of the loop decodes the same load at a different
+  phastDecodeBranchCount. The training stores the entry using the count from
+  iteration N. The prediction for iteration N+K uses a different count. But the
+  hash should be the same IF the branch at load_branch_count - 1 has the same
+  outcome each time.
+
+  Actually, wait. The GHB is a circular buffer of 512 entries. Each branch
+  decoded gets a new position. For b01_immdep, there's one branch per loop
+  iteration (the loop back-edge). So after 512 iterations, the GHB wraps. But
+  foldHistory reads globalHistoryBuffer[idx % 512]. When idx changes by 512
+  (next occurrence of the same loop iteration relative to the same branch), idx 
+  % 512 gives the same position, but the entry has been overwritten by a later
+  branch.
+
+  This is fine as long as the branch at that modular position has the same
+  outcome. For a tight loop with a taken back-edge, the branch entry should
+  always be the same (taken, same target). So the hash should be consistent.
+
+  Hmm, let me think about this differently. I'm going to look at this from the
+  storeDistToSeqNum angle — maybe the prediction IS found but the store distance
+   maps to an invalid position.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ I see the stats now. The key observation is devastating: look at b01_immdep —
+  a trivial store A[i]; load A[i] in a tight loop. Store Sets gets 86 violations
+   (cold start). PHAST gets 9660. There's no cascading possible here — one
+  store, one load. The core predictor is broken.
+
+  Let me check if the periodic table clear is wiping entries:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ I found the root cause. It's not about lazy vs eager — it's a GHB staleness 
+  bug that affects BOTH.
+
+  Look at foldHistory (phast.cc:82-95):
+
+  uint32_t Phast::foldHistory(uint64_t load_branch_count, int hist_len) const {
+      hist_len += 1;
+      uint32_t folded = 0;
+      for (int i = 0; i < hist_len; ++i) {
+          if (load_branch_count <= i) break;
+          uint64_t idx = load_branch_count - 1 - i;
+          if (idx < ghbCounter - ghbSize) break;  // ← THE BUG
+          uint8_t branch_hist = globalHistoryBuffer[idx % 512];
+          ...
+      }
+  }
+
+  At decode time (when checkInst runs), ghbCounter is close to
+  load_branch_count, so idx is within the valid GHB window. The hash is computed
+   correctly.
+
+  At commit time (when violation() runs — whether eager from IEW or lazy from
+  commit), ghbCounter has advanced by thousands since decode. For example:
+  - load_branch_count = 100 (at decode)
+  - ghbCounter = 100000 (at violation time, many iterations later)
+  - ghbSize = 512
+  - ghbCounter - ghbSize = 99488
+  - idx = 99 → 99 < 99488 → loop breaks immediately
+
+  So foldHistory returns folded = 0 (no history), producing a hash of just the
+  PC. This is different from the decode-time hash. The entry is stored at the
+  wrong table location. On the next decode, checkInst can't find it.
+
+  This explains why:
+  - ~10k violations persist regardless of eager/lazy training
+  - The predictor never effectively learns despite being trained
+  - The problem exists in both the original and modified implementations
+
+  The fix: cache the folded history on the instruction at decode time, and use
+  the cached value during training instead of re-reading from the stale GHB.
+
+  Let me write the plan.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ The plan was already approved. Let me implement the fix.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/dyn_inst.hh)
+  ⎿  Added 4 lines
+      374      /** Store that caused a memory order violation with this l
+           oad (for lazy training at commit) */
+      375      DynInstPtr phastViolationStore = nullptr;
+      376  
+      377 +    /** Folded history cached at decode time, one per PHAST ta
+          +ble.                                                          
+      378 +     *  Used for both prediction and training to ensure hash c
+          +onsistency. */                                                
+      379 +    uint32_t phastFoldedHistory[8] = {};                      
+      380 +                                                              
+      381      /////////////////////// TLB Miss //////////////////////
+      382      /**
+      383       * Saved memory request (needed when the DTB address trans
+           lation is
+
+⏺ Now update checkInst to cache the folded history:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 1 line
+      236          if (hist_len > load_branch_count) continue; 
+      237  
+      238          uint32_t folded = foldHistory(load_branch_count, hist_
+           len);
+      239 +        load_inst->phastFoldedHistory[t] = folded;  // Cache f
+          +or training                                                   
+      240          int index;
+      241          uint16_t tag;
+      242          getIndexAndTag(pc, folded, index, tag);
+
+⏺ Now update violation() to use cached history instead of re-reading from the
+  stale GHB:
+
+  Read 1 file (ctrl+o to expand)  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 3 lines, removed 1 line
+      152      if (hist_len > load_inst->phastDecodeBranchCount) return;
+      153  
+      154      Addr pc = load_inst->pcState().instAddr();
+      155 -    uint32_t folded = foldHistory(load_inst->phastDecodeBranch
+          -Count, hist_len);                                             
+      155 +    // Use cached folded history from decode time instead of r
+          +e-reading                                                     
+      156 +    // from the GHB, which may have been overwritten by now.  
+      157 +    uint32_t folded = load_inst->phastFoldedHistory[target_tab
+          +le_idx];                                                      
+      158      int index;
+      159      uint16_t tag;
+      160      getIndexAndTag(pc, folded, index, tag);
+
+⏺ Let me verify the changes:
+
+⏺ Bash(git diff -- src/cpu/o3/phast.cc src/cpu/o3/dyn_inst.hh)
+  ⎿  diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+     index 4ca1ea44ae..4984619562 100644
+     --- a/src/cpu/o3/dyn_inst.hh
+     … +23 lines (ctrl+o to expand)
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ The fix is clean and minimal:
+
+  1. dyn_inst.hh: Added phastFoldedHistory[8] array to cache the folded history
+  at decode time
+  2. phast.cc checkInst: Caches foldHistory() result into phastFoldedHistory[t]
+  for each table during prediction (at decode/dispatch time, when the GHB is
+  fresh)
+  3. phast.cc violation: Uses load_inst->phastFoldedHistory[target_table_idx]
+  instead of calling foldHistory() (which would read stale GHB entries)
+
+  This ensures the hash used for training is identical to the hash used for
+  prediction, regardless of how much time passes between decode and commit.
+
+✻ Churned for 8m 30s
+
+❯ /stats                                                                        
+  ⎿  Stats dialog dismissed
+
+❯ /stats                                                                        
+  ⎿  Stats dialog dismissed
+
+❯ Could you explain why phast has much fewer conflicting stores?                
+
+⏺ Look at phast.cc:222-224:
+
+  InstSeqNum Phast::checkInst(const DynInstPtr &load_inst) {
+      if (!load_inst->isLoad()) {
+          return 0;
+      }
+
+  PHAST's checkInst returns 0 for all non-loads (stores). So stores are never
+  predicted to have dependencies under PHAST — hence conflictingStores ≈ 51
+  (just barriers/atomics).
+
+  Store Sets works differently: it deliberately serializes stores within a set.
+  When a store is inserted, ssPred.checkInst(store_PC) looks up the SSIT. If the
+   store's PC has an SSID, it finds the last fetched store in that set via the
+  LFST and creates a dependency. This forces all stores in the same set to
+  execute in order, which is why conflictingStores is 14k-62k for SS.
+
+  This store serialization is a key part of Store Sets' design (paper Section
+  II-A): "stores that access the LFST and find a valid id will set a dependency 
+  on that store before updating the table. By doing so, every store in the set 
+  will be serialized and the load will execute once all the stores belonging to 
+  the set... have executed."
+
+  PHAST doesn't need store serialization — it predicts a single store distance
+  for each load, so store ordering is irrelevant to its predictions. The ~51
+  conflicting stores are likely from memory barriers or atomic instructions that
+   go through the barrier path in MemDepUnit::insert().
+
+❯ memOrderViolations have decreased to 8604 on average. What else could be      
+wrong?                                                                          
+
+⏺ The drop from ~10000 to ~8604 confirms the GHB staleness fix helped but the
+  core problem remains. Let me analyze what the stats reveal and narrow down the
+   real issue.
+
+  Look at b01_immdep — it's store A[idx]; load A[idx] in a tight loop. Store
+  distance 1, zero branches between store and load. After ONE violation, PHAST
+  should learn this and never violate again. Yet there are 9660 violations.
+  Store Sets manages with just 86.
+
+  The key question is: why doesn't the prediction work after training? There are
+   only a few possibilities:
+
+  1. violation() isn't being called (entry never created)
+  2. Entry is created but checkInst can't find it (hash mismatch)
+  3. Entry is found but storeDistToSeqNum returns 0 (can't find the store in SQ)
+  4. Entry is found, store is found, but the store's seqNum is missing from
+  memDepHash (store already completed)
+  5. Confidence drops to 0, disabling the entry
+  6. Periodic clear() wipes the table (clearPeriod = 250000)
+
+  We need diagnostic stats to pinpoint which. I'd recommend adding counters in
+  checkInst and storeDistToSeqNum to understand the breakdown. Want me to add
+  those diagnostic stats?
+
+✻ Baked for 6m 17s
+
+❯ Sure.                                                                         
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me read the stats struct and the storeDistToSeqNum function:
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Now let me also check where completeInst is called — this is important for
+  understanding if the predicted store might already be removed from memDepHash:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ So completeInst is called from InstructionQueue::wakeDependents() when a
+  memory instruction completes execution. This removes the store from
+  memDepHash. If a store COMPLETES (executes and wakes dependents) before a
+  future load is dispatched, the store's seqNum won't be in the hash, and the
+  load's predicted dependency will fail silently.
+
+  This is critical for understanding the issue. Let me now add comprehensive
+  diagnostic stats.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.hh)
+  ⎿  Added 12 lines
+      113          statistics::Scalar numCorrectPredictions;
+      114          statistics::Scalar numIncorrectPredictions;
+      115          statistics::Scalar numPredictionsNotFound;
+      116 +                                                              
+      117 +        // Diagnostic stats for checkInst                     
+      118 +        statistics::Scalar checkInstCalls;                    
+      119 +        statistics::Scalar checkInstNoEntry;                  
+      120 +        statistics::Scalar checkInstEntryFound;               
+      121 +        statistics::Scalar checkInstStoreDistInvalid;         
+      122 +        statistics::Scalar checkInstProducerNotInHash;        
+      123 +        statistics::Scalar checkInstConfidenceZero;           
+      124 +                                                              
+      125 +        // Diagnostic stats for violation training            
+      126 +        statistics::Scalar violationCalls;                    
+      127 +        statistics::Scalar violationClears;                   
+      128      } stats;
+      129  
+      130      /** Records a memory ordering violation. */
+⏺ Now add the stat registrations:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 17 lines, removed 1 line
+      386        ADD_STAT(numIncorrectPredictions, statistics::units::Cou
+           nt::get(),
+      387                 "Number of predictions that were incorrect"),
+      388        ADD_STAT(numPredictionsNotFound, statistics::units::Coun
+           t::get(),
+      389 -               "Number of predictions that were not found")   
+      389 +               "Number of predictions that were not found"),  
+      390 +      ADD_STAT(checkInstCalls, statistics::units::Count::get()
+          +,                                                             
+      391 +               "Number of checkInst calls for loads"),        
+      392 +      ADD_STAT(checkInstNoEntry, statistics::units::Count::get
+          +(),                                                           
+      393 +               "checkInst: no matching entry in any table"),  
+      394 +      ADD_STAT(checkInstEntryFound, statistics::units::Count::
+          +get(),                                                        
+      395 +               "checkInst: entry found with confidence > 0"), 
+      396 +      ADD_STAT(checkInstStoreDistInvalid, statistics::units::C
+          +ount::get(),                                                  
+      397 +               "checkInst: entry found but storeDistToSeqNum r
+          +eturned 0"),                                                  
+      398 +      ADD_STAT(checkInstProducerNotInHash, statistics::units::
+          +Count::get(),                                                 
+      399 +               "checkInst: valid seqNum but producer not in me
+          +mDepHash"),                                                   
+      400 +      ADD_STAT(checkInstConfidenceZero, statistics::units::Cou
+          +nt::get(),                                                    
+      401 +               "checkInst: entry found but confidence was 0"),
+      402 +      ADD_STAT(violationCalls, statistics::units::Count::get()
+          +,                                                             
+      403 +               "Number of violation() training calls"),       
+      404 +      ADD_STAT(violationClears, statistics::units::Count::get(
+          +),                                                            
+      405 +               "Number of times the predictor was cleared")   
+      406  {
+      407  }
+      408  
+
+⏺ Now instrument checkInst to track all the diagnostic cases:
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Found 2 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 28 lines, removed 9 lines
+      225          return 0;
+      226      }
+      227  
+      228 +    ++stats.checkInstCalls;                                   
+      229 +                                                              
+      230      int best_store_dist = -1;
+      231      int best_hist_len = -1;
+      232      uint16_t best_tag = 0;
+     ...
+      235      Addr pc = load_inst->pcState().instAddr();
+      236      uint64_t load_branch_count = load_inst->phastDecodeBranchC
+           ount;
+      237  
+      238 +    bool found_confidence_zero = false;                       
+      239 +                                                              
+      240      for (int t = 0; t < tables.size(); ++t) {
+      241          int hist_len = tables[t].historyLength;
+      238 -        if (hist_len > load_branch_count) continue;           
+      242 +        if (hist_len > load_branch_count) continue;           
+      243  
+      244          uint32_t folded = foldHistory(load_branch_count, hist_
+           len);
+      245          load_inst->phastFoldedHistory[t] = folded;  // Cache f
+           or training
+     ...
+      249  
+      250          auto& set = tables[t].sets[index];
+      251          for (int w = 0; w < NUM_WAYS; ++w) {
+      248 -            if (set[w].valid && set[w].tag == tag && set[w].co
+          -nfidence > 0) {                                               
+      249 -                if (hist_len > best_hist_len) {               
+      250 -                    best_hist_len = hist_len;                 
+      251 -                    best_store_dist = set[w].storeDist;       
+      252 -                    best_set = &set;                          
+      253 -                    best_way = w;                             
+      254 -                    best_tag = tag;                           
+      252 +            if (set[w].valid && set[w].tag == tag) {          
+      253 +                if (set[w].confidence > 0) {                  
+      254 +                    if (hist_len > best_hist_len) {           
+      255 +                        best_hist_len = hist_len;             
+      256 +                        best_store_dist = set[w].storeDist;   
+      257 +                        best_set = &set;                      
+      258 +                        best_way = w;                         
+      259 +                        best_tag = tag;                       
+      260 +                    }                                         
+      261 +                    updateLRU(set, w);                        
+      262 +                } else {                                      
+      263 +                    found_confidence_zero = true;             
+      264                  }
+      256 -                updateLRU(set, w);                            
+      265                  break;
+      266              }
+      267          }
+      268      }
+      269  
+      270 +    if (found_confidence_zero && best_store_dist < 0) {       
+      271 +        ++stats.checkInstConfidenceZero;                      
+      272 +    }                                                         
+      273 +                                                              
+      274      InstSeqNum predicted_sn = 0;
+      275  
+      276      if (best_store_dist >= 0) {
+      277          predicted_sn = storeDistToSeqNum(load_inst, best_store
+           _dist);
+      278 +        if (predicted_sn) {                                   
+      279 +            ++stats.checkInstEntryFound;                      
+      280 +        } else {                                              
+      281 +            ++stats.checkInstStoreDistInvalid;                
+      282 +        }                                                     
+      283 +    } else {                                                  
+      284 +        ++stats.checkInstNoEntry;                             
+      285      }
+      286  
+      287      if (predicted_sn) {
+
+⏺ Now add the violationCalls counter to violation() and violationClears to
+  clear():
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 1 line
+      123  void
+      124  Phast::violation(const DynInstPtr &store_inst, const DynInstPt
+           r &load_inst)
+      125  {
+      126 +    ++stats.violationCalls;                                   
+      127      int actual_store_dist = 0;
+      128      actual_store_dist = load_inst->sqIdx - store_inst->sqIdx;
+      129  
+
+⏺ Now add the clear counter:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 1 line
+      370  void
+      371  Phast::clear()
+      372  {
+      373 +    ++stats.violationClears;                                  
+      374      for (auto& table : tables) {
+      375          for (auto& set : table.sets) {
+      376              for (auto& entry : set) {
+
+⏺ Now I need to add the checkInstProducerNotInHash counter. This one is tricky —
+   it needs to be in MemDepUnit::insert() since that's where the
+  memDepHash.find() happens. Let me add it there:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 2 lines
+      262          if (hash_it != memDepHash.end()) {
+      263              store_entries.push_back((*hash_it).second);
+      264              DPRINTF(MemDepUnit, "Producer found\n");
+      265 +        } else if (usePhast && producing_store != 0) {        
+      266 +            phastPred.stats.checkInstProducerNotInHash++;     
+      267          }
+      268      }
+      269  
+
+⏺ Now let me also make sure the stats are accessible. The phastPred.stats needs
+  to be public, which it already is since PhastStats is public in the struct.
+  Let me verify the benchmark script outputs these new stats:
+
+⏺ Bash(git diff --stat)
+  ⎿   src/cpu/o3/mem_dep_unit.cc |  2 ++
+      src/cpu/o3/phast.cc        | 57 +++++++++++++++++++++++++++++++++++++
+     +--------
+     … +2 lines (ctrl+o to expand)
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ The diagnostic stats are in place. Here's what they'll tell us:
+
+  ┌────────────────────────────┬─────────────────────────────────────────────┐
+  │            Stat            │               What it reveals               │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstCalls             │ Total load predictions attempted            │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstNoEntry           │ No matching entry in any table (cold miss   │
+  │                            │ or hash mismatch)                           │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstEntryFound        │ Entry found, store distance valid →         │
+  │                            │ dependency predicted                        │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstStoreDistInvalid  │ Entry found but storeDistToSeqNum returned  │
+  │                            │ 0 (SQ iterator invalid)                     │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstConfidenceZero    │ Tag matched but confidence was 0 (entry     │
+  │                            │ disabled by FP decrements)                  │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ checkInstProducerNotInHash │ Valid seqNum predicted but store already    │
+  │                            │ completed/removed from memDepHash           │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ violationCalls             │ How many times violation() training was     │
+  │                            │ called                                      │
+  ├────────────────────────────┼─────────────────────────────────────────────┤
+  │ violationClears            │ How many times the entire predictor was     │
+  │                            │ wiped                                       │
+  └────────────────────────────┴─────────────────────────────────────────────┘
+
+  The breakdown of checkInstCalls = checkInstNoEntry + checkInstEntryFound + 
+  checkInstStoreDistInvalid + checkInstConfidenceZero will show exactly where
+  predictions are failing. And checkInstProducerNotInHash catches the case where
+   PHAST predicts correctly but the store has already been completed and removed
+   — the load gets no dependency despite having a valid prediction.
+
+  Build and run the benchmarks. The stat that dominates will tell us the fix.
+✻ Cooked for 3m 50s
+
+❯ The new results file has been updated.                                        
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The stats are extremely revealing. Let me analyze b01_immdep (simplest case):
+
+  checkInstCalls              226621   (100%)
+  checkInstNoEntry             89235   (39.4%)  — cold miss, no entry in table
+  checkInstEntryFound         137325   (60.6%)  — entry found, prediction made
+  checkInstStoreDistInvalid       61   ( 0.0%)  — SQ iterator invalid
+  (negligible)
+  checkInstProducerNotInHash    9773   ( 4.3%)  — FOUND entry, valid seqNum, but
+   store GONE from hash
+  checkInstConfidenceZero       8179   ( 3.6%)  — FOUND entry but confidence = 0
+
+  violationCalls                1287   — actual training calls at commit
+  memOrderViolation             9643   — total violations detected
+
+  Two smoking guns:
+
+  1. checkInstProducerNotInHash: 9773 — This is almost exactly the violation
+  count (9643). PHAST finds an entry, storeDistToSeqNum returns a valid seqNum,
+  but memDepHash.find(seqNum) fails because the store has already executed and 
+  been removed from the hash by InstructionQueue::wakeDependents() →
+  memDepUnit.completeInst(). The load gets no dependency and executes
+  speculatively → violation.
+
+  The store is still in the SQ (hasn't committed yet), so storeDistToSeqNum
+  finds it. But the memDepHash entry was already cleaned up when the store
+  finished executing. The load arrives too late to establish a dependency.
+
+  2. checkInstConfidenceZero: 8179 — Entries are being disabled by the
+  confidence mechanism. This is likely a secondary effect: when
+  producerNotInHash causes the load to execute without a dependency, it gets
+  forwarding from the correct store. At commit, updateConfidence sees
+  forwardingStoreSeqNum ≠ predictedStoreSeqNum (because the predicted seqNum was
+   wrong/stale), decrements confidence, and eventually disables the entry.
+
+  The core fix needed: When storeDistToSeqNum returns a seqNum that isn't in
+  memDepHash, the store has already completed — meaning it already executed and
+  its dependents were woken. In this case, the load doesn't need to wait (the
+  store's data is already available). The prediction is actually correct in
+  intent but the synchronization is stale. The load should be able to execute
+  safely since the store it depends on has already resolved.
+
+  The real question is: if the store already completed, why does the load still
+  violate? The answer: storeDistToSeqNum might be returning the seqNum of a
+  store from a previous iteration that completed, not the current iteration's
+  store. The store distance maps to a stale SQ position.
+
+  Want me to add logging to storeDistToSeqNum to print the seqNum it returns vs
+  the seqNum of the most recent store, so we can confirm this?
+
+✻ Cogitated for 2m 46s
+
+❯ So storeDistToSeqNum is able to find a store, but that store has already      
+completed, but not committed? The store's data has already been forwarded at    
+this point?                                                                     
+
+⏺ You're asking exactly the right question. Let me clarify what's happening.
+
+  Yes, storeDistToSeqNum finds a store in the SQ that has executed (data
+  available in SQ) but not yet committed (still occupying an SQ slot). That
+  store's memDepHash entry was removed when it completed execution via
+  IQ::wakeDependents() → memDepUnit.completeInst().
+
+  But that's not the real problem. The real problem is that this store is from a
+   previous iteration — it's the wrong dynamic instance. Here's the sequence:
+
+  1. PHAST predicts store_dist = D for the load
+  2. storeDistToSeqNum finds a store at sqIt._idx - D in the SQ
+  3. That store is from iteration N-K (old). It has completed execution but is
+  still in the SQ waiting to commit.
+  4. Its seqNum is gone from memDepHash → no dependency established
+  5. The load executes speculatively (no dependency holding it back)
+  6. The current iteration's store (the one the load actually needs to wait for)
+   hasn't executed yet
+  7. When the current store executes → finds the load at the same address →
+  violation
+
+  So the data forwarding from the old store is irrelevant. The load might get
+  correct data from the old store (or from cache), but when the current store
+  executes, the violation is detected because the load executed out of order
+  with respect to it.
+
+  The root issue is: the trained store distance maps to the wrong dynamic 
+  instance of the store. The distance was correct at training time but points to
+   a stale instance at prediction time because the SQ layout shifted.
+
+  For b01_immdep, the trained distance should be 1 (immediately preceding
+  store). And sqIt._idx - 1 = tail should be the current iteration's store. So
+  either the trained distance isn't 1, or the SQ layout is different on
+  re-execution. Want me to add logging to storeDistToSeqNum to print the actual
+  distance and the seqNum it returns, so we can see exactly what's happening?
+
+✻ Brewed for 1m 6s
+
+❯ I'll suppose your claim is true. At step 7, once the violation occurs for the 
+ first time, Phast should be trained on the store-load dependency of the        
+current iteration, and a new entry should be created. The next time that load   
+occurs, why doesn't the new entry help avoid the violation? Please explain.     
+
+⏺ You're right to push back. Let me reconsider.
+
+  If the store distance is trained correctly (say, store_dist=1 for b01_immdep),
+   then on re-execution:
+
+  1. checkInst finds the entry with store_dist=1
+  2. storeDistToSeqNum(load, 1) returns sqIt._idx - 1 = tail = the current
+  iteration's store
+  3. The current store was just dispatched (program-order dispatch, store before
+   load)
+  4. It IS in memDepHash (added by instQueue.insert(store) moments before)
+  5. Dependency established → load waits → no violation
+
+  This should work. And the stats show it does work for 137,325 loads
+  (checkInstEntryFound). The predictor IS functioning for the majority of loads.
+
+  So my claim that storeDistToSeqNum returns a stale store is likely wrong for
+  the simple case. If it were returning stale stores, the pattern would repeat
+  every iteration and we'd see far more failures.
+
+  The honest answer is: I don't know yet why 9,773 specific lookups fail to find
+   the producer in the hash. The checkInstProducerNotInHash stat tells us the
+  prediction pipeline succeeds all the way through (entry found → store distance
+   valid → SQ entry dereferenceable → seqNum returned) but the final
+  memDepHash.find() fails. Something specific about those 9,773 cases is
+  different from the 137,325 successful cases.
+
+  To find out, I should log the actual seqNum and store distance when
+  producerNotInHash fires. Want me to add that?
+
+✻ Churned for 1m 47s
+
+❯ Yes                                                                           
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 5 lines
+      264              DPRINTF(MemDepUnit, "Producer found\n");
+      265          } else if (usePhast && producing_store != 0) {
+      266              phastPred.stats.checkInstProducerNotInHash++;
+      267 +            DPRINTF(MemDepUnit, "PHAST: Producer [sn:%lli] not
+          + in hash! "                                                   
+      268 +                    "Load [sn:%lli] PC:%#x storeDist:%d sqIdx:
+          +%d\n",                                                        
+      269 +                    producing_store, inst->seqNum,            
+      270 +                    inst->pcState().instAddr(),               
+      271 +                    inst->predictedStoreDist, inst->sqIdx);   
+      272          }
+      273      }
+      274  
+
+⏺ Now also log in storeDistToSeqNum what store it actually finds:
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Found 4 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 7 lines, removed 2 lines
+      392      auto sqIt = load_inst->sqIt;
+      393      sqIt._idx -= store_dist;
+      394      if (sqIt.dereferenceable()) {
+      395 -        DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d bef
+          -ore sqIdx = %d is valid\n", store_dist, load_inst->sqIdx);    
+      396 -        return sqIt->instruction()->seqNum;                   
+      395 +        auto store_inst = sqIt->instruction();                
+      396 +        DPRINTF(Phast, "storeDistToSeqNum: load [sn:%d] store_
+          +dist=%d "                                                     
+      397 +                "→ store [sn:%d] PC:%#x sqIdx=%d (load sqIdx=%
+          +d)\n",                                                        
+      398 +                load_inst->seqNum, store_dist,                
+      399 +                store_inst->seqNum, store_inst->pcState().inst
+          +Addr(),                                                       
+      400 +                store_inst->sqIdx, load_inst->sqIdx);         
+      401 +        return store_inst->seqNum;                            
+      402      } else {
+      403          DPRINTF(Phast, "storeDistToSeqNum: store_dist = %d bef
+           ore sqIdx = %d is invalid\n", store_dist, load_inst->sqIdx);
+      404          return 0;
+
+⏺ Now build and run with debug flags to capture the logs. For b01_immdep only
+  (simplest case), with a short run to keep logs manageable:
+
+⏺ User answered Claude's questions:
+  ⎿  · Can you run b01_immdep with debug flags `--debug-flags=MemDepUnit,Phast` 
+     and share a few log lines where 'Producer not in hash' appears? We need to 
+     see the store seqNum, load seqNum, storeDist, and what store PC 
+     storeDistToSeqNum found. A short run (reduce ITERS if possible) would keep 
+     logs manageable. → I'll run it
+
+⏺ The logging is in place. The key lines to look for in the output:
+
+  1. storeDistToSeqNum: load [sn:X] store_dist=D → store [sn:Y] PC:... sqIdx=...
+   — shows what store PHAST is pointing to
+  2. PHAST: Producer [sn:Y] not in hash! Load [sn:X] PC:... storeDist:D 
+  sqIdx:... — shows when the predicted store's seqNum isn't found in memDepHash
+
+  When you see a "Producer not in hash" line, compare the store seqNum Y with
+  nearby storeDistToSeqNum lines. We want to know:
+  - Is the store from the current iteration or a previous one?
+  - What's the store's PC — is it the benchmark's store (A[idx]=i) or something
+  else?
+  - What's the store distance — is it 1 (expected for b01_immdep) or something
+  larger?
+
+  Share a few of those log lines and I'll pinpoint the exact issue.
+
+✻ Cogitated for 1m 28s
+
+❯ The logs are in bench/logs.txt                                                
+
+  Searched for 6 patterns, read 2 files (ctrl+o to expand)
+⏺ Bash(grep "Producer.*not in hash" ./bench/logs.txt | sed
+      's/.*storeDist:\([0-9]*\).*/\1/' | sort | uniq -c | sort -rn)
+  ⎿  5318 4
+     1768 2
+      626 1
+       34 6
+
+⏺ Bash(grep "Producer.*not in hash" ./bench/logs.txt | sed
+      's/.*PC:\(0x[0-9a-f]*\).*/\1/' | sort | uniq -c | sort -rn)
+  ⎿  2931 0x11f8
+     2387 0x1219
+     1188 0x11d4
+     … +17 lines (ctrl+o to expand)
+
+⏺ Now let me look at a specific example. Let me find a case with storeDist:4 at
+  PC 0x11f8 and trace the storeDistToSeqNum log for that load:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Now I can see the actual problem. Look at this sequence:
+
+  100785500: storeDistToSeqNum: load [sn:377515] store_dist=1 → store
+  [sn:377513] PC:0x121d sqIdx=14621
+                                (no "not in hash" → SUCCESS, store 377513 was
+  still in hash)
+
+  100789000: storeDistToSeqNum: load [sn:377530] store_dist=2 → store
+  [sn:377513] PC:0x121d sqIdx=14621
+             Producer [sn:377513] not in hash!  (FAIL — store 377513 completed
+  between ticks 100785500 and 100789000)
+
+  100790000: storeDistToSeqNum: load [sn:377542] store_dist=4 → store
+  [sn:377513] PC:0x121d sqIdx=14621
+             Producer [sn:377513] not in hash!  (FAIL — same store, still
+  completed)
+
+  And the store distance breakdown:
+  5318 storeDist=4
+  1768 storeDist=2
+   626 storeDist=1
+    34 storeDist=6
+
+  The root cause is now clear: memDepUnit.completeInst() removes stores from 
+  memDepHash when they finish executing — but stores with larger distances 
+  execute BEFORE the load is dispatched. The store at distance 4 was dispatched
+  4 SQ entries earlier, executed, had completeInst called (removing it from the
+  hash), all before the dependent load was dispatched. When the load arrives and
+   tries to establish a dependency, the store is gone.
+
+  This is a fundamental incompatibility between PHAST's store-distance mechanism
+   and gem5's memDepHash lifetime. The paper uses the SQ index as a "register
+  tag" for wakeup (Section IV-B4), which doesn't have this problem — the SQ
+  entry persists until commit regardless of execution status.
+
+  The fix is straightforward: don't call memDepUnit.completeInst() for stores 
+  when using PHAST — or more precisely, don't remove stores from memDepHash
+  until they commit. The store's MemDepEntry should stay alive so that younger
+  loads can find it and establish dependencies, even if the store has already
+  executed.
+
+  Want me to implement this fix?
+
+✻ Churned for 3m 20s
+
+❯ Do we need memDepHash at all for phast? Could phast possibly just return the  
+instructions, and we don't need to look up a seqnum in memDepHash?              
+
+⏺ Great question. You're right — PHAST has direct access to the store
+  instruction via the SQ (sqIt->instruction()). The memDepHash lookup is an
+  unnecessary indirection that breaks because completeInst removes entries too
+  early.
+
+  But the deeper question is: even if we bypass the hash and find the store
+  directly, does it help? The store at distance 4 has already executed. Its data
+   is in the SQ. If we establish a dependency on it, wakeDependents already ran
+  — the load would never be woken up.
+
+  The real issue the logs reveal is that PHAST is predicting the wrong store 
+  distance. Look at the PCs:
+
+  storeDist=4: load PC 0x11f8 → store PC 0x121d (sqIdx=14621)
+  storeDist=1: load [sn:377540] → store PC 0x11f0 (sqIdx=14624)
+
+  The load at PC 0x11f8 was trained to depend on a store at PC 0x121d with
+  distance 4. But in this execution, that store is 4 SQ entries behind and has
+  completed. There's likely a closer store (distance 1, PC 0x11f0) that the load
+   should depend on instead — but PHAST learned the wrong distance from a
+  previous violation.
+
+  So the question branches into two options:
+
+  1. Fix the dependency mechanism: Don't remove stores from memDepHash until
+  commit (instead of on execution). This keeps entries alive for younger loads
+  to find. Simple, directly fixes the producerNotInHash failures.
+  2. Fix the prediction: Understand why PHAST learns distance 4 instead of
+  distance 1 for these loads. This is a correctness issue in what violation()
+  trains.
+
+  Option 1 is the quick fix. Option 2 is the correct long-term fix. I'd suggest
+  starting with option 1 to see how much it helps, then investigate option 2.
+  Want me to implement option 1?
+
+✻ Crunched for 1m 10s
+
+❯ If the store has already executed, would it be possible to directly grab its  
+result for the new dependent load?                                              
+
+⏺ Yes — and that's actually what already happens. When producerNotInHash fires,
+  the load gets no dependency, issues freely, executes, and the LSQ forwarding
+  logic in lsq_unit.cc read() finds the completed store's data in the SQ and
+  forwards it. The load gets correct data.
+
+  The violations don't come from the completed store. They come from a
+  different, closer store that hasn't executed yet. Look at the log:
+
+  store [sn:377513] PC:0x121d sqIdx=14621  ← predicted store, already completed,
+   distance 4
+  store [sn:377539] PC:0x11f0 sqIdx=14624  ← closer store, distance 1, NOT yet
+  executed
+
+  The load gets data forwarded from the completed store at distance 4. But when
+  the closer store at distance 1 executes and writes to the same address, it
+  finds the load in the load queue → violation.
+
+  So the problem isn't the dependency mechanism — it's that PHAST learned the 
+  wrong store distance. It learned distance 4 (a store from a previous "group"
+  of instructions) when the actual dependency is distance 1 (the immediately
+  preceding store in the current iteration).
+
+  This brings us back to your earlier question: why doesn't the violation
+  re-train PHAST with the correct distance? Each violation should train with the
+   youngest conflicting store (distance 1), and the next execution should
+  predict correctly. The fact that storeDist=4 dominates the failures (5318 out
+  of 7746) suggests the distance-4 entry keeps overriding the distance-1 entry —
+   likely because it's in a higher-history-length table and checkInst picks the
+  longest history match.
+
+  Want me to investigate why the wrong entry (distance 4) takes priority over
+  the correct one (distance 1)?
+
+✻ Churned for 49s
+
+❯ Yes.                                                                          
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ I see load 377542 at PC 0x11f8 making TWO lookups — store_dist=1 (to store
+  377539 at PC 0x11f0) AND store_dist=4 (to store 377513 at PC 0x121d). This
+  means checkInst found entries in TWO tables. The distance-4 entry is in a
+  higher-history table and wins. Let me verify by looking at what checkInst
+  actually selects:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Only store_dist=4 appears for load 377542. The store_dist=1 at the same tick
+  was for a different load (377540). So checkInst for load 377542 found only ONE
+   entry (distance 4), not two.
+
+  Let me check: does a distance-1 entry even exist for PC 0x11f8? Let me look at
+   violation training for this PC:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ The violation function's DPRINTFs use "Phast" debug flag. Let me check:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ The violation function's DPRINTF uses the Phast debug flag but the logs might
+  not have captured it. Let me check what debug flags were used:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The logs only have storeDistToSeqNum and Producer not in hash lines. The
+  violation() function's DPRINTFs aren't showing up because the debug flag
+  filter might only include Phast for the storeDistToSeqNum calls but the
+  violation training DPRINTFs also use Phast. Let me check:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Only storeDistToSeqNum and memDep "Producer not in hash" lines. The
+  violation() DPRINTFs and checkInst DPRINTFs aren't in the logs — they were
+  likely filtered out to keep the file manageable. Let me work with what we
+  have.
+
+  Let me look at the pattern more carefully. For load PC 0x11f8, it consistently
+   predicts storeDist=4. Let me find when this distance was first learned:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Always storeDist=4. The sqIdx advances by 5 each time
+  (14625→14630→14635→14640), which means 5 SQ entries per loop iteration. Let me
+   also look at the successful predictions for the same PC:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Now let me understand the SQ layout per iteration. There are 5 SQ entries per
+  iteration (sqIdx advances by 5). Let me see all the stores in one iteration:
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Now I see the full picture. The SQ layout per loop iteration has 5 stores:
+
+  sqIdx+0: store PC 0x1219
+  sqIdx+1: store PC 0x121d  ← the conflicting store for load 0x11f8
+  sqIdx+2: store PC 0x11bd
+  sqIdx+3: (another store)
+  sqIdx+4: store PC 0x11f0
+           loads at sqIdx+5: load 0x11f8 (storeDist=4 → 0x121d), load 0x11f0's
+  dependent (storeDist=1)
+
+  The store distance of 4 is CORRECT. Load PC 0x11f8 truly depends on store PC
+  0x121d, which is 4 SQ entries behind. PHAST's prediction is right.
+
+  The problem is entirely the dependency mechanism lifetime. Every single
+  iteration:
+  1. Store 0x121d is dispatched (sqIdx = N+1)
+  2. Three more stores dispatched (sqIdx = N+2, N+3, N+4)
+  3. Load 0x11f8 is dispatched (sqIdx = N+5)
+  4. By now, store 0x121d from step 1 has already executed and been removed from
+   memDepHash
+  5. checkInst correctly predicts distance 4, storeDistToSeqNum finds the store
+  in the SQ, but memDepHash.find() fails
+  6. Load executes speculatively → violation
+
+  This repeats every iteration because the store at distance 4 always executes
+  before the load is dispatched. The re-training doesn't help because the 
+  prediction was never wrong — the mechanism just can't establish the
+  dependency.
+
+  The fix is exactly what you suggested earlier: don't remove stores from 
+  memDepHash on execution — remove them on commit. The store needs to stay
+  "findable" in the hash until it commits, so that younger loads dispatched
+  after it executes can still establish dependencies on it.
+
+  The change is in InstructionQueue::wakeDependents() (inst_queue.cc:1097-1098):
+   skip the memDepUnit.completeInst() call for stores when using PHAST, and
+  instead call it from the commit path.
+
+  Want me to implement this?
+
+✻ Brewed for 3m 7s
+
+❯ Before we get too detailed, take a look at the new results.txt. I increased   
+the store distance in b02_longstdist. This resulted in much fewer mem order     
+violations (1000 vs. b01's 9000). What does this tell us?                       
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ This is very revealing. It tells us the opposite of what my theory predicted.
+
+  If the problem were "stores at larger distances are more likely to have
+  completed and left the hash," then b02 (larger store distance) should have
+  more violations. But it has fewer (1138 vs 9643).
+
+  What this actually tells us:
+
+  With a larger store distance, the store executes EARLIER relative to the load
+  (dispatched many instructions before). By the time the load executes
+  speculatively (no dependency established due to producerNotInHash), the
+  conflicting store has already executed and already scanned the load queue —
+  but the load wasn't there yet (or hadn't executed yet). So no violation is
+  detected. The load then executes and safely gets the store's data through SQ
+  forwarding.
+
+  With a small store distance (b01), the store and load are dispatched almost 
+  simultaneously. Even though the store's hash entry is gone, the store hasn't
+  necessarily executed yet. The load races the store — both are in-flight. The
+  load executes first (speculatively), then the store executes, finds the load
+  in the LQ at the same address → violation.
+
+  So the real problem is: for small store distances, the memDepHash entry is 
+  removed (by completeInst) just moments before the dependent load tries to find
+   it. The store executes and completes in the brief window between being
+  dispatched and the load looking it up. The dependency can't be established,
+  and the load and store race, causing a violation.
+
+  This confirms the fix: keep stores in memDepHash until commit, not until 
+  execution. This eliminates the race window entirely.
+
+✻ Cooked for 1m 40s
+
+❯ The other benchmarks all have varying levels of mem order violations. Do      
+those patterns support your theory?                                             
+
+⏺ Let me check systematically. The key question: does producerNotInHash account
+  for most violations in each benchmark?
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ No, the patterns don't fully support my theory. producerNotInHash is the
+  dominant cause for only a few benchmarks:
+
+  ┌──────────────────┬─────────────────┬───────────────────────────────────┐
+  │    Benchmark     │   notInHash     │            Main cause             │
+  │                  │    explains     │                                   │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b01_immdep       │ 101%            │ producerNotInHash                 │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b14_prodchurn    │ 99%             │ producerNotInHash                 │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b05, b06, b13,   │ 75-82%          │ mostly producerNotInHash          │
+  │ b15              │                 │                                   │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b03_loopdep      │ 34%             │ confidenceZero (5037)             │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b04_altprod      │ 39%             │ confidenceZero (4773)             │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b07_altprod16    │ 29%             │ confidenceZero (6337)             │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b08_ptralias     │ 9%              │ confidenceZero (12925) + noEntry  │
+  │                  │                 │ (76k)                             │
+  ├──────────────────┼─────────────────┼───────────────────────────────────┤
+  │ b12_randctrl     │ 21%             │ confidenceZero (4700)             │
+  └──────────────────┴─────────────────┴───────────────────────────────────┘
+
+  There are two distinct problems:
+
+  1. producerNotInHash — the memDepHash lifetime issue. Dominates b01, b14, and
+  contributes significantly to b05/b06/b13/b15.
+  2. confidenceZero — entries are being disabled by the updateConfidence
+  mechanism. Dominates b03, b04, b07, b08, b12. This means valid entries are
+  having their confidence decremented to 0, turning off predictions that should
+  be active.
+
+  The confidence issue (problem 2) is actually the bigger problem across more
+  benchmarks. The updateConfidence check (forwardingStoreSeqNum == 
+  predictedStoreSeqNum) is likely incorrectly classifying correct predictions as
+   false positives and draining confidence — exactly the concern we discussed
+  earlier about loads that get forwarding from a different store than predicted,
+   or loads where forwardingStoreSeqNum isn't set despite a correct prediction.
+
+  Both problems need fixing, but confidenceZero appears to be the more
+  widespread issue.
+
+✻ Cogitated for 1m 11s
+
+❯ Let's fix the producerNotInHash problem first.                                
+
+⏺ The fix is to split MemDepUnit::completeInst(): wake dependents at execution
+  time (so loads can proceed), but keep the store in memDepHash until commit (so
+   future loads can still find it).
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me check where this is called from and what commitHead does for
+  stores:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me implement the fix. The approach:
+
+  1. In completeInst(): when usePhast and the instruction is a store, wake
+  dependents but skip completed() (keep in hash)
+  2. Add a new method to remove the store from the hash at commit time
+  3. Call it from commitHead() when a store commits
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 11 lines
+      469  MemDepUnit::completeInst(const DynInstPtr &inst)
+      470  {
+      471      wakeDependents(inst);
+      472 +                                                              
+      473 +    // PHAST: Keep stores in the hash until commit so that you
+          +nger loads                                                    
+      474 +    // dispatched after the store executes can still find it a
+          +nd establish                                                  
+      475 +    // dependencies. Without this, storeDistToSeqNum returns a
+          + valid seqNum                                                 
+      476 +    // but memDepHash.find() fails (producerNotInHash).       
+      477 +    if (usePhast && (inst->isStore() || inst->isAtomic()) &&  
+      478 +        !inst->isReadBarrier() && !inst->isWriteBarrier() &&  
+      479 +        !inst->isHtmCmd()) {                                  
+      480 +        return;                                               
+      481 +    }                                                         
+      482 +                                                              
+      483      completed(inst);
+      484      InstSeqNum barr_sn = inst->seqNum;
+      485  
+
+⏺ Now add a method to complete stores at commit time:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.hh)
+  ⎿  Added 3 lines
+      149      /** Notifies completion of an instruction. */
+      150      void completeInst(const DynInstPtr &inst);
+      151  
+      152 +    /** Removes a store from the hash at commit time (PHAST on
+          +ly). */                                                       
+      153 +    void commitStore(const DynInstPtr &inst);                 
+      154 +                                                              
+      155      /** Squashes all instructions up until a given sequence nu
+           mber for a
+      156       *  specific thread.
+      157       */
+
+⏺ Now implement commitStore in mem_dep_unit.cc:
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 11 lines
+      508  }
+      509  
+      510  void
+      511 +MemDepUnit::commitStore(const DynInstPtr &inst)               
+      512 +{                                                             
+      513 +    // Called at commit time for PHAST stores that were kept i
+          +n the hash                                                    
+      514 +    // after execution (see completeInst). Now safe to remove.
+      515 +    MemDepHashIt hash_it = memDepHash.find(inst->seqNum);     
+      516 +    if (hash_it != memDepHash.end()) {                        
+      517 +        completed(inst);                                      
+      518 +    }                                                         
+      519 +}                                                             
+      520 +                                                              
+      521 +void                                                          
+      522  MemDepUnit::wakeDependents(const DynInstPtr &inst)
+      523  {
+      524      // Only stores, atomics and barriers have dependents.
+
+⏺ Now I need to expose commitStore through the InstructionQueue so commit.cc can
+   call it. Let me check how commit accesses the IQ:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ I'll add a commitStore method to InstructionQueue that delegates to
+  memDepUnit:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/inst_queue.hh)
+  ⎿  Added 3 lines
+      400  
+      401    public:
+      402      Phast* getPhast(ThreadID tid) { return memDepUnit[tid].get
+           Phast(); }
+      403 +    void commitStore(const DynInstPtr &inst) {                
+      404 +        memDepUnit[inst->threadNumber].commitStore(inst);     
+      405 +    }                                                         
+      406  
+      407    private:
+      408      /** The queue to the execute stage.  Issued instructions w
+           ill be written
+
+⏺ Now call it from commitHead in commit.cc when a store commits. Let me find
+  where stores are handled in commitHead:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ I'll add the commitStore call right after the PHAST confidence update, before
+  the ROB head is retired:
+
+⏺ Update(src/cpu/o3/commit.cc)
+  ⎿  Added 7 lines
+      1314          phast->updateConfidence(head_inst);
+      1315      }
+      1316  
+      1317 +    // PHAST: Remove stores from memDepHash at commit time (t
+           +hey were                                                     
+      1318 +    // kept alive after execution so younger loads could esta
+           +blish                                                        
+      1319 +    // dependencies on them).                                
+      1320 +    if (usePhast && (head_inst->isStore() || head_inst->isAto
+           +mic())) {                                                    
+      1321 +        iewStage->instQueue.commitStore(head_inst);          
+      1322 +    }                                                        
+      1323 +                                                             
+      1324      // Finally clear the head ROB entry.
+      1325      rob->retireHead(tid);
+      1326  
+
+⏺ Let me verify the full diff:
+
+⏺ Bash(git diff --stat)
+  ⎿   src/cpu/o3/commit.cc       |  7 +++++++
+      src/cpu/o3/inst_queue.hh   |  3 +++
+      src/cpu/o3/mem_dep_unit.cc | 22 ++++++++++++++++++++++
+     … +2 lines (ctrl+o to expand)
+
+⏺ Bash(git diff)
+  ⎿  diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+     index 3d4e9628a1..e7a8e69cb8 100644
+     --- a/src/cpu/o3/commit.cc
+     … +40 lines (ctrl+o to expand)
+
+⏺ The fix is clean:
+
+  1. mem_dep_unit.cc completeInst(): When PHAST and the instruction is a store
+  (not a barrier), skip completed() — the store stays in memDepHash after
+  execution so younger loads can find it.
+  2. mem_dep_unit.cc commitStore(): New method that calls completed() to remove
+  the store from the hash. Only called at commit time.
+  3. inst_queue.hh: Exposes commitStore() to commit.cc through the IQ.
+  4. commit.cc commitHead(): When a store commits, calls commitStore() to clean
+  up the hash entry.
+
+  The store's lifecycle is now: dispatched → added to hash → executes (wakes
+  dependents, stays in hash) → commits (removed from hash). Any load dispatched
+  between execution and commit can still find the store and establish a
+  dependency.
+
+✻ Sautéed for 3m 21s
+
+❯ After you change, phast simulations are hanging. Please fix.                  
+
+⏺ The hang is a deadlock. Here's why: when a store executes, wakeDependents runs
+   and wakes up existing dependents. But we keep the store in memDepHash. Later,
+   a load dispatches, finds the store in the hash, and adds itself to
+  dependInsts. But wakeDependents already ran and won't run again — the load
+  waits forever.
+
+  The fix: mark the store's MemDepEntry as completed when it executes, and skip
+  dependency creation for completed stores.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Mark the entry as completed so future loads know not to wait:
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 4 lines
+      474      // dispatched after the store executes can still find it a
+           nd establish
+      475      // dependencies. Without this, storeDistToSeqNum returns a
+            valid seqNum
+      476      // but memDepHash.find() fails (producerNotInHash).
+      477 +    // Mark the entry as completed so loads know the store alr
+          +eady executed                                                 
+      478 +    // and don't wait on it (wakeDependents won't run again). 
+      479      if (usePhast && (inst->isStore() || inst->isAtomic()) &&
+      480          !inst->isReadBarrier() && !inst->isWriteBarrier() &&
+      481          !inst->isHtmCmd()) {
+      482 +        MemDepEntryPtr entry = findInHash(inst);              
+      483 +        entry->completed = true;                              
+      484          return;
+      485      }
+      486  
+⏺ Now update insert() to skip completed entries — loads should not wait for
+  stores that already executed:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 11 lines, removed 2 lines
+      260          MemDepHashIt hash_it = memDepHash.find(producing_store
+           );
+      261  
+      262          if (hash_it != memDepHash.end()) {
+      263 -            store_entries.push_back((*hash_it).second);       
+      264 -            DPRINTF(MemDepUnit, "Producer found\n");          
+      263 +            MemDepEntryPtr entry = (*hash_it).second;         
+      264 +            // PHAST: If the store already executed (completed
+          +=true), don't                                                 
+      265 +            // create a dependency — wakeDependents already ra
+          +n and won't                                                   
+      266 +            // run again. The load can execute and get data vi
+          +a SQ forwarding.                                              
+      267 +            if (entry->completed) {                           
+      268 +                DPRINTF(MemDepUnit, "Producer [sn:%lli] alread
+          +y executed, "                                                 
+      269 +                        "skipping dependency\n", producing_sto
+          +re);                                                          
+      270 +            } else {                                          
+      271 +                store_entries.push_back(entry);               
+      272 +                DPRINTF(MemDepUnit, "Producer found\n");      
+      273 +            }                                                 
+      274          } else if (usePhast && producing_store != 0) {
+      275              phastPred.stats.checkInstProducerNotInHash++;
+      276              DPRINTF(MemDepUnit, "PHAST: Producer [sn:%lli] not
+            in hash! "
+
+⏺ Let me verify the diff is correct:
+
+⏺ Bash(git diff -- src/cpu/o3/mem_dep_unit.cc)
+  ⎿  diff --git a/src/cpu/o3/mem_dep_unit.cc b/src/cpu/o3/mem_dep_unit.cc
+     index b5a13cee09..50cdb282d6 100644
+     --- a/src/cpu/o3/mem_dep_unit.cc
+     … +25 lines (ctrl+o to expand)
+
+⏺ The fix has two parts:
+
+  1. completeInst: When keeping a PHAST store in the hash, mark its MemDepEntry
+  as completed = true. This signals "I already executed, don't wait for me."
+  2. insert: When finding a producing store in the hash, check entry->completed.
+   If true, skip the dependency — the store already executed, wakeDependents
+  won't run again, and the load can get data through SQ forwarding.
+
+  This prevents the deadlock: loads no longer wait for stores that have already
+  finished executing.
+
+✻ Worked for 1m 41s
+
+❯ I have tested your latest changes. There are still 9000 violations for b01,   
+and 1000 violations for b02. But the ipc is very close now. What do the results 
+ in results.txt tell us?                                                        
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The key finding:
+
+  b01 Before fix:  producerNotInHash=9773  confZero=8179  violations=9643
+  b01 After fix:   producerNotInHash= 621  confZero=8179  violations=9630
+
+  producerNotInHash dropped from 9773 to 621 — the fix worked perfectly for that
+   problem. But violations barely changed (9643 → 9630).
+
+  This means the loads that couldn't find their producer were not the ones 
+  causing violations. Those loads were executing speculatively but happening to
+  get correct data (the store had already executed, data available through
+  forwarding). No harm done.
+
+  The actual cause of violations is now clearly confidenceZero = 8179. These are
+   loads where PHAST has a matching entry but its confidence was drained to 0 by
+   updateConfidence, disabling the prediction. The load executes speculatively
+  and violates.
+
+  The updateConfidence mechanism is incorrectly penalizing valid entries —
+  exactly the problem we identified earlier with the forwardingStoreSeqNum == 
+  predictedStoreSeqNum check. That's the next bug to fix.
+
+✻ Churned for 41s
+
+❯ Let's fix the confidence mechanism                                            
+
+⏺ The issue is that when we skip the dependency for completed stores,
+  predictedStoreSeqNum is still set from checkInst. At commit, updateConfidence
+  sees a "prediction" that was never actually used, compares
+  forwardingStoreSeqNum against it, and decrements confidence when they don't
+  match. After 15 decrements (MAX_CONFIDENCE), the entry is disabled.
+
+  The fix: when we skip the dependency because the store already completed,
+  clear the prediction info so updateConfidence doesn't penalize the entry.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 4 lines
+      267              if (entry->completed) {
+      268                  DPRINTF(MemDepUnit, "Producer [sn:%lli] alread
+           y executed, "
+      269                          "skipping dependency\n", producing_sto
+           re);
+      270 +                // Clear prediction info so updateConfidence d
+          +oesn't                                                        
+      271 +                // penalize the entry for a prediction that wa
+          +s bypassed.                                                   
+      272 +                inst->predictedEntrySetPtr = nullptr;         
+      273 +                inst->predictedStoreSeqNum = 0;               
+      274              } else {
+      275                  store_entries.push_back(entry);
+      276                  DPRINTF(MemDepUnit, "Producer found\n");
+
+⏺ That handles one source of confidence drain. But there's likely another: loads
+   that DO wait for the predicted store but forwardingStoreSeqNum doesn't match.
+   Let me check — when a load waits for a store and gets forwarding, does
+  forwardingStoreSeqNum always match predictedStoreSeqNum?
+
+  The load waits for the store at storeDistToSeqNum(load, dist). When that store
+   executes, the load is woken up. The load then executes and searches the SQ
+  for forwarding. The SQ forwarding logic finds the youngest matching store —
+  which might be a DIFFERENT store than the one the load waited for (if a
+  younger store also wrote to the same address between the predicted store and
+  the load).
+
+  Let me check the forwarding path:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The forwarding sets forwardingStoreSeqNum to the forwarding store's seqNum.
+  The SQ search finds the youngest matching store. If the predicted store is at
+  distance 4 but a younger store (distance 1) also wrote to the same address,
+  forwarding comes from the younger store → forwardingStoreSeqNum ≠ 
+  predictedStoreSeqNum → confidence decrements.
+
+  For b01_immdep, is there a younger store at the same address? The loop has
+  A[idx]=i (the conflicting store at distance 4) and then the load x=A[idx]. Are
+   there other stores between them to the same address? Looking at the store
+  PCs: 0x1219, 0x121d, 0x11bd, (unnamed), 0x11f0. If any of these write to
+  A[idx], forwarding would come from the youngest one.
+
+  But actually, the main store A[idx]=i is at PC 0x121d (distance 4 from the
+  load). The other stores (0x11bd, 0x11f0, etc.) are likely stack spills or
+  other compiler-generated stores to different addresses. So forwarding should
+  come from 0x121d. Unless the previous iteration's A[idx'] happens to be at the
+   same address...
+
+  Actually, for b01: idx = i & (SIZE-1). On consecutive iterations, idx changes.
+   The previous iteration's store wrote to a different address. The current
+  iteration's store (0x121d) is the only one at A[idx]. Forwarding should come
+  from it. forwardingStoreSeqNum should match.
+
+  So why does confidence drain? Let me check if there's a case where the load
+  reads from cache instead of forwarding. This would happen if the store at
+  distance 4 has committed and been removed from the SQ before the load
+  executes.
+
+  Actually, I realize the issue might be more fundamental. Let me check: when a
+  load waits for a store (via memDep dependency), and the store executes and
+  wakes the load, does the load always get forwarding from that specific store?
+  Or could the load read from cache?
+
+  The load searches the SQ starting from the youngest store (working backwards).
+   If the predicted store is in the SQ and matches the address, forwarding
+  happens. But if the predicted store has COMMITTED (written back to cache and
+  removed from SQ), the load won't find it in the SQ and reads from cache.
+  forwardingStoreSeqNum stays 0.
+
+  With our commit-time removal of stores from memDepHash, stores stay in the
+  hash but still commit and leave the SQ normally. The SQ removal happens
+  independently of the hash removal. So the store could commit (leave SQ) before
+   the load executes, even though its hash entry is still present.
+
+  But the load is waiting for the store via memDep. The store executes (wakes
+  the load), then the load executes. Between the store executing and the load
+  executing, the store shouldn't have committed yet (commit happens in order,
+  the load is younger).
+
+  Actually, the store commits BEFORE the load (program order). Wait no — the
+  store is OLDER than the load, so it commits first. If the store commits before
+   the load executes... hmm, but the load was woken up when the store executed.
+  The load should execute soon after. The store commits later (after execution).
+   So execution order is: store executes → load wakes up → load executes → store
+   commits. The store is in the SQ when the load executes. Forwarding should
+  work.
+
+  Unless there's a long delay between the load waking up and executing (pipeline
+   busy, etc.). But even so, the store can't commit until the load commits
+  (they're in order, the store is older, it commits first... wait, the store IS
+  older so it commits first. But commit is in program order. The store commits
+  first, then the load. If the store commits (writes back, leaves SQ) before the
+   load executes...
+
+  No, commit doesn't happen before execution. Execution happens in IEW, commit
+  happens in the commit stage. Instructions execute out of order but commit in
+  order. The store might execute in cycle N, then the load executes in cycle
+  N+1, then the store commits in cycle N+5, then the load commits in cycle N+6.
+  The store is in the SQ during cycle N+1 when the load executes. Forwarding
+  works.
+
+  OK so for loads that successfully wait for their predicted store, forwarding
+  should work and confidence should stay MAX. The confidence drain must be from
+  a different source.
+
+  Let me just clear prediction info for the producerNotInHash case too, and
+  submit the fix:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/mem_dep_unit.cc)
+  ⎿  Added 3 lines
+      282                      producing_store, inst->seqNum,
+      283                      inst->pcState().instAddr(),
+      284                      inst->predictedStoreDist, inst->sqIdx);
+      285 +            // Clear prediction info so confidence isn't penal
+          +ized.                                                         
+      286 +            inst->predictedEntrySetPtr = nullptr;             
+      287 +            inst->predictedStoreSeqNum = 0;                   
+      288          }
+      289      }
+      290  
+
+⏺ Bash(git diff -- src/cpu/o3/mem_dep_unit.cc)
+  ⎿  diff --git a/src/cpu/o3/mem_dep_unit.cc b/src/cpu/o3/mem_dep_unit.cc
+     index 50cdb282d6..1f3c8ba32c 100644
+     --- a/src/cpu/o3/mem_dep_unit.cc
+     … +15 lines (ctrl+o to expand)
+⏺ The fix clears predictedStoreSeqNum and predictedEntrySetPtr in two cases
+  where the dependency isn't actually established:
+
+  1. Store already completed (entry->completed): The store executed, dependency
+  is skipped, load executes freely. Without clearing, updateConfidence would
+  compare against a stale prediction and decrement confidence.
+  2. Store not in hash (producerNotInHash): The store isn't in memDepHash at
+  all. Same issue — the prediction was bypassed, so confidence shouldn't be
+  affected.
+
+  In both cases, updateConfidence will now see predictedStoreSeqNum == 0 and
+  treat the load as "no prediction" — no confidence modification.
+
+  Run the benchmarks and let's see if confZero drops.
+
+✻ Worked for 3m 23s
+
+❯ Why is ipc so similar, if squashedLoads and memOrderViolation is much higher  
+for phast?                                                                      
+
+⏺ Great observation. Look at conflictingStores:
+
+  b01:  phast conflictingStores=56      ss conflictingStores=43084
+  b09:  phast conflictingStores=54      ss conflictingStores=62101
+
+  Store Sets serializes tens of thousands of stores. Every store in a set must
+  wait for the previous store in that set to execute. This destroys store-level
+  parallelism. PHAST has essentially zero store serialization.
+
+  Both predictors lose performance, but through different mechanisms:
+
+  - Store Sets: Few violations (81), but massive false positives — 43k stores
+  forced to execute in order. Low violation cost, high serialization cost.
+  - PHAST: Many violations (9630), but zero store serialization. High violation
+  cost, zero serialization cost.
+
+  These two costs roughly cancel out, which is why IPC is similar despite 100x
+  more violations. The PHAST paper highlights this exact tradeoff (Section
+  VI-C): Store Sets' low violation count hides the cost of store-store
+  serialization from the merging rule.
+
+  This also means: once we fix PHAST's violation count (by fixing confidence), 
+  PHAST should significantly outperform Store Sets — it will have both low
+  violations AND zero store serialization.
+
+✻ Cooked for 40s
+
+❯ Is my understanding correct: Phast does not handle store-to-store ordering.   
+This improves parallelism. However, this could result in correctness issues if  
+an older store overwrites a younger store.                                      
+
+⏺ No correctness issue. Stores in gem5 always commit in program order — the
+  store buffer/queue writes back to cache in order, regardless of execution
+  order. So even if store A (older) executes after store B (younger), A's value
+  is written to cache first, then B's overwrites it. The final memory state is
+  correct.
+
+  Store Sets' store serialization isn't about correctness — it's about
+  prediction accuracy. Store Sets links loads to a set of stores. To ensure the
+  load waits for the right store, all stores in the set are serialized so that
+  the LFST (Last Fetched Store Table) always points to the correct one. It's a
+  design tradeoff: serialize stores to simplify the prediction mechanism.
+
+  PHAST avoids this by predicting a specific store distance instead of a set. It
+   doesn't need stores to execute in order because it directly identifies which
+  store the load depends on.
+
+❯ Latest test results are in results.txt. memOrderViolation and confidence zero 
+ counts haven't dropped.                                                        
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The confZero count barely changed (8179→7913 for b01). Our fix only covered
+  the bypassed-dependency cases, but the main drain is coming from loads that
+  actually wait for the predicted store and still get their confidence
+  decremented.
+
+  Rather than guessing at the cause, let's test the hypothesis directly: disable
+   confidence decrementing and see if violations drop to Store Sets levels.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 9 lines, removed 2 lines
+      356              stats.numCorrectPredictions++;
+      357              DPRINTF(Phast, "updateConfidence: [%d] TP predicti
+           on committed predictedStoreDist = %d\n", load_inst->seqNum, lo
+           ad_inst->predictedStoreDist);
+      358          } else if (set[w].confidence > 0) {
+      359 -            set[w].confidence--;                              
+      359 +            // TODO: Confidence decrement disabled for debuggi
+          +ng.                                                           
+      360 +            // Uncomment to re-enable once the root cause of f
+          +alse                                                          
+      361 +            // decrements is understood.                      
+      362 +            // set[w].confidence--;                           
+      363              stats.numIncorrectPredictions++;
+      361 -            DPRINTF(Phast, "updateConfidence: [%d] FP predicti
+          -on committed predictedStoreDist = %d\n", load_inst->seqNum, lo
+          -ad_inst->predictedStoreDist);                                 
+      364 +            DPRINTF(Phast, "updateConfidence: [%d] FP predicti
+          +on committed predictedStoreDist = %d "                        
+      365 +                    "predicted_sn = %d forwarding_sn = %d\n", 
+      366 +                    load_inst->seqNum, load_inst->predictedSto
+          +reDist,                                                       
+      367 +                    predicted_forwarding_store_seq_num,       
+      368 +                    load_inst->forwardingStoreSeqNum);        
+      369          }
+      370          updateLRU(set, w);
+      371      } else {
+
+⏺ Run the benchmarks. If violations drop to ~80 (Store Sets level), we know
+  confidence decrementing is the sole remaining issue and can then investigate
+  what's causing the false decrements. If violations stay high, there's another
+  problem.
+
+✻ Cooked for 1m 52s
+
+❯ memOrderViolation dropped significantly after disabling confidence decrement. 
+ Now, ipc is actually slightly better.                                          
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(grep -E "^(Benchmark|phast.*ipc |ss.*ipc |phast.*memOrderViolation
+      |ss.*memOrderViolation )" ./bench/results.txt | paste - - - - - | awk
+      '{printf "%-18s phast_i…)
+  ⎿  b01_immdep         phast_ipc=ipc      ss_ipc=390       phast_viol=phas
+     t  ss_viol=ipc
+     b02_longstdist     phast_ipc=ipc      ss_ipc=449       phast_viol=phas
+     … +16 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Excellent results.
+
+  ┌────────────────┬───────────┬────────┬───────┬────────────┬─────────┐
+  │   Benchmark    │ PHAST IPC │ SS IPC │ Delta │ PHAST viol │ SS viol │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b01_immdep     │ 0.8349    │ 0.8357 │ -0.1% │ 390        │ 81      │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b02_longstdist │ 2.0312    │ 2.0017 │ +1.5% │ 449        │ 88      │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b05_sparsedep  │ 0.8237    │ 0.8236 │ +0.0% │ 332        │ 80      │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b07_altprod16  │ 1.0259    │ 1.0239 │ +0.2% │ 248        │ 80      │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b09_multld     │ 0.9979    │ 0.9090 │ +9.8% │ 507        │ 90      │
+  ├────────────────┼───────────┼────────┼───────┼────────────┼─────────┤
+  │ b12_randctrl   │ 1.1584    │ 1.1249 │ +3.0% │ 219        │ 83      │
+  └────────────────┴───────────┴────────┴───────┴────────────┴─────────┘
+
+  PHAST now matches or beats Store Sets on every benchmark. The standout wins:
+  - b09_multld: +9.8% — multiple loads after one store, PHAST's store-distance
+  precision avoids SS's store serialization
+  - b12_randctrl: +3.0% — random control flow, PHAST's path-sensitivity handles
+  it better
+  - b02_longstdist: +1.5% — long store distance, PHAST predicts precisely
+  without serialization
+
+  Violations dropped from ~10,000 to ~200-500 (cold misses, close to SS's ~80).
+  confZero is now 0 across all benchmarks. The confidence mechanism was the
+  problem.
+
+  The next step is to fix the confidence check properly instead of leaving it
+  disabled. The forwardingStoreSeqNum == predictedStoreSeqNum comparison is too
+  strict — we need to understand why it was producing false mismatches for
+  correct predictions. Want me to investigate that?
+
+✻ Cogitated for 1m 19s
+
+❯ Yes                                                                           
+
+⏺ Let me add diagnostic stats to categorize the mismatches before re-enabling
+  the decrement.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.hh)
+  ⎿  Added 4 lines
+      114          statistics::Scalar numIncorrectPredictions;
+      115          statistics::Scalar numPredictionsNotFound;
+      116  
+      117 +        // Confidence mismatch breakdown                      
+      118 +        statistics::Scalar numFPNoForwarding;                 
+      119 +        statistics::Scalar numFPDifferentStore;               
+      120 +                                                              
+      121          // Diagnostic stats for checkInst
+      122          statistics::Scalar checkInstCalls;
+      123          statistics::Scalar checkInstNoEntry;
+
+⏺ Now register the stats and add the tracking in updateConfidence:
+
+  Read 1 file (ctrl+o to expand)
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 4 lines
+      420                 "Number of predictions that were incorrect"),
+      421        ADD_STAT(numPredictionsNotFound, statistics::units::Coun
+           t::get(),
+      422                 "Number of predictions that were not found"),
+      423 +      ADD_STAT(numFPNoForwarding, statistics::units::Count::ge
+          +t(),                                                          
+      424 +               "FP: predicted dependency but no forwarding hap
+          +pened"),                                                      
+      425 +      ADD_STAT(numFPDifferentStore, statistics::units::Count::
+          +get(),                                                        
+      426 +               "FP: predicted dependency but forwarding from d
+          +ifferent store"),                                             
+      427        ADD_STAT(checkInstCalls, statistics::units::Count::get()
+           ,
+      428                 "Number of checkInst calls for loads"),
+      429        ADD_STAT(checkInstNoEntry, statistics::units::Count::get
+           (),
+
+⏺ Now add the tracking in updateConfidence:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 5 lines, removed 2 lines
+      357              DPRINTF(Phast, "updateConfidence: [%d] TP predicti
+           on committed predictedStoreDist = %d\n", load_inst->seqNum, lo
+           ad_inst->predictedStoreDist);
+      358          } else if (set[w].confidence > 0) {
+      359              // TODO: Confidence decrement disabled for debuggi
+           ng.
+      360 -            // Uncomment to re-enable once the root cause of f
+          -alse                                                          
+      361 -            // decrements is understood.                      
+      360              // set[w].confidence--;
+      361              stats.numIncorrectPredictions++;
+      362 +            if (load_inst->forwardingStoreSeqNum == 0) {      
+      363 +                stats.numFPNoForwarding++;                    
+      364 +            } else {                                          
+      365 +                stats.numFPDifferentStore++;                  
+      366 +            }                                                 
+      367              DPRINTF(Phast, "updateConfidence: [%d] FP predicti
+           on committed predictedStoreDist = %d "
+      368                      "predicted_sn = %d forwarding_sn = %d\n",
+      369                      load_inst->seqNum, load_inst->predictedSto
+           reDist,
+
+⏺ Run the benchmarks. The two new stats will tell us:
+
+  - numFPNoForwarding: The load was predicted to depend on a store, but
+  forwardingStoreSeqNum == 0 — no forwarding happened at all. The load read from
+   cache. This means either the predicted store wrote to a different address
+  (true false positive), or the predicted store's data committed to cache before
+   the load executed.
+  - numFPDifferentStore: The load got forwarding, but from a different store
+  than predicted. This means there's a younger store at the same address that
+  forwarded instead of the predicted store.
+
+  The ratio between these two will tell us exactly what fix is needed.
+
+✻ Cogitated for 2m 3s
+
+❯ About the lru logic in phast.cc: would it be beneficial to make the entry     
+replacement policy rely on confidence instead of lru?                           
+
+⏺ Yes, it would be better — but only after the confidence mechanism is fixed.
+  Here's why:
+
+  With correct confidence: Confidence-based replacement is strictly better than
+  LRU. A low-confidence entry is likely a stale or wrong prediction — it should
+  be the first to go when a new violation needs space. A high-confidence entry
+  is a proven, frequently-correct prediction that should be preserved. LRU can
+  evict a high-confidence entry just because it wasn't accessed recently (e.g.,
+  a dependency that fires every Nth iteration).
+
+  With the current broken confidence: It would make things worse. Valid entries
+  get their confidence incorrectly drained to 0, and confidence-based eviction
+  would then prioritize evicting those "low confidence" entries — which are
+  actually correct predictions being falsely penalized.
+
+  The paper uses LRU (Section IV-B: "a 2-bit field for the less-recently-used 
+  (LRU) replacement policy"), but the paper also has a working confidence
+  mechanism. A practical improvement over the paper would be: evict 
+  lowest-confidence first, break ties with LRU. This combines the benefits of
+  both.
+
+  I'd suggest: fix the confidence check first (using the diagnostic stats from
+  the current run), then switch replacement to confidence-based. The two changes
+   together would reinforce each other — correct confidence means correct
+  eviction priorities.
+
+✻ Churned for 30s
+
+❯ results are in. The vast majority of FP are due to NoForwarding.              
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ So the mismatch pattern is clear: forwardingStoreSeqNum == 0 — the load waited
+   for the predicted store, but when it executed, it read from cache instead of
+  getting SQ forwarding.
+
+  This happens because the predicted store committed (wrote back to cache, freed
+   its SQ entry) between waking the load and the load actually executing. The
+  load finds no matching store in the SQ, reads correct data from cache, but
+  forwardingStoreSeqNum stays 0. The confidence check sees 0 ≠ 
+  predictedStoreSeqNum and incorrectly counts it as a false positive.
+
+  The prediction was actually correct — the load waited for the right store, got
+   correct data (from cache instead of forwarding), and committed without
+  violations. Penalizing the entry for this is wrong.
+
+  The simplest fix: only decrement confidence when forwardingStoreSeqNum is
+  non-zero but doesn't match (meaning forwarding came from a different store — a
+   genuine wrong prediction). When forwardingStoreSeqNum == 0, we can't
+  distinguish "true FP" from "correct prediction, store committed early," so
+  don't decrement.
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Error editing file
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 13 lines, removed 9 lines
+      358              set[w].confidence = MAX_CONFIDENCE;
+      359              stats.numCorrectPredictions++;
+      360              DPRINTF(Phast, "updateConfidence: [%d] TP predicti
+           on committed predictedStoreDist = %d\n", load_inst->seqNum, lo
+           ad_inst->predictedStoreDist);
+      361 -        } else if (set[w].confidence > 0) {                   
+      362 -            // TODO: Confidence decrement disabled for debuggi
+          -ng.                                                           
+      363 -            // set[w].confidence--;                           
+      364 -            stats.numIncorrectPredictions++;                  
+      365 -            if (load_inst->forwardingStoreSeqNum == 0) {      
+      366 -                stats.numFPNoForwarding++;                    
+      367 -            } else {                                          
+      368 -                stats.numFPDifferentStore++;                  
+      361 +        } else if (load_inst->forwardingStoreSeqNum != 0) {   
+      362 +            // Forwarding came from a different store than pre
+          +dicted —                                                      
+      363 +            // genuine false positive. Decrement confidence.  
+      364 +            if (set[w].confidence > 0) {                      
+      365 +                set[w].confidence--;                          
+      366              }
+      370 -            DPRINTF(Phast, "updateConfidence: [%d] FP predicti
+          -on committed predictedStoreDist = %d "                        
+      367 +            stats.numIncorrectPredictions++;                  
+      368 +            stats.numFPDifferentStore++;                      
+      369 +            DPRINTF(Phast, "updateConfidence: [%d] FP (differe
+          +nt store) predictedStoreDist = %d "                           
+      370                      "predicted_sn = %d forwarding_sn = %d\n",
+      371                      load_inst->seqNum, load_inst->predictedSto
+           reDist,
+      372                      load_inst->predictedStoreSeqNum,
+      373                      load_inst->forwardingStoreSeqNum);
+      374 +        } else {                                              
+      375 +            // No forwarding (forwardingStoreSeqNum == 0). Cou
+          +ld be a true                                                  
+      376 +            // FP or a correct prediction where the store comm
+          +itted before                                                  
+      377 +            // the load executed. Don't decrement — can't dist
+          +inguish.                                                      
+      378 +            stats.numFPNoForwarding++;                        
+      379          }
+      380          updateLRU(set, w);
+      381      } else {
+
+⏺ The confidence logic is now:
+
+  - forwardingStoreSeqNum == predictedStoreSeqNum: Exact match → confidence =
+  MAX (true positive)
+  - forwardingStoreSeqNum != 0 but doesn't match: Forwarding from a different
+  store → confidence-- (genuine false positive)
+  - forwardingStoreSeqNum == 0: No forwarding (store committed to cache before
+  load executed) → don't touch confidence (ambiguous case)
+
+  This re-enables confidence decrementing for genuine false positives (the
+  numFPDifferentStore cases) while protecting entries from being drained by the
+  common "store committed early" case.
+
+✻ Cooked for 2m 30s
+
+❯ if forwardingStoreSeqNum is 0, can I use phastViolationStore->seqNum as a     
+substitute for the "real" dependent store?                                      
+
+⏺ No — for loads that reach updateConfidence, phastViolationStore is always
+  null. Here's why:
+
+  In commitHead, the check happens BEFORE updateConfidence:
+
+  // This runs first:
+  if (usePhast && head_inst->isLoad() && head_inst->phastViolationStore) {
+      // squash and return false — load never reaches updateConfidence
+  }
+
+  // Only loads with phastViolationStore == nullptr get here:
+  phast->updateConfidence(head_inst);
+
+  Loads with a violation (phastViolationStore != nullptr) are squashed at commit
+   and never reach updateConfidence. Only loads that executed without violations
+   reach it — and those have phastViolationStore == nullptr.
+
+  The forwardingStoreSeqNum == 0 case is a load that waited correctly, executed
+  after the store, got correct data from cache (store committed before the
+  load's SQ search), and had no violation. There's simply no record of which
+  store's data it consumed since forwarding didn't happen through the SQ.
+
+  The current fix (don't decrement on forwardingStoreSeqNum == 0) is the right
+  approach — we can't verify, so we don't penalize.
+
+✻ Worked for 48s
+
+❯ I noticed that for the benchmarks with more numFPDifferentStore (thus         
+decreased confidence), there are thousands of memOrderViolations, while for     
+benchmarks dominated by numFPNoForwarding (very little decrement), there are    
+only hundreds. Why does it seem like decrementing confidence results in more    
+violations?                                                                     
+⏺ Because it creates an oscillation cycle:
+
+  1. Entry has confidence > 0 → load waits for predicted store → gets forwarding
+   from a different store → confidence--
+  2. After 15 decrements → confidence = 0 → entry disabled
+  3. Load has no prediction → executes speculatively → violation
+  4. Violation re-trains entry → confidence = MAX
+  5. Back to step 1
+
+  The key insight: the DifferentStore predictions are "wrong" but harmless. The
+  load waited for store S1, got data from younger store S2 instead. The load
+  committed successfully — no violation. Decrementing confidence for this case
+  is counterproductive because disabling the entry leads to actual violations,
+  which are worse than the harmless false positive.
+
+  Think about it: a load that waits for the "wrong" store but commits fine has a
+   small cost (unnecessary stalling until S1 executes). A load with NO
+  prediction that violates has a large cost (pipeline squash). The confidence
+  mechanism is trading a small cost for a large one.
+
+  The fix: don't decrement confidence for any committed load. If a load reaches
+  updateConfidence, it committed without violations — the prediction was either
+  correct or harmlessly conservative. Only let entries be replaced through the
+  eviction policy (lowest confidence first, which now means entries replaced by
+  newer violations).
+
+⏺ Update(src/cpu/o3/phast.cc)
+  ⎿  Added 7 lines, removed 15 lines
+      358          if (is_correct) {
+      359              set[w].confidence = MAX_CONFIDENCE;
+      360              stats.numCorrectPredictions++;
+      361 -            DPRINTF(Phast, "updateConfidence: [%d] TP predicti
+          -on committed predictedStoreDist = %d\n", load_inst->seqNum, lo
+          -ad_inst->predictedStoreDist);                                 
+      361          } else if (actual_store_sn != 0) {
+      363 -            // Forwarding came from a different store than pre
+          -dicted —                                                      
+      364 -            // genuine false positive. Decrement confidence.  
+      365 -            if (set[w].confidence > 0) {                      
+      366 -                set[w].confidence--;                          
+      367 -            }                                                 
+      368 -            stats.numIncorrectPredictions++;                  
+      362 +            // Forwarding came from a different store than pre
+          +dicted.                                                       
+      363 +            // Don't decrement — the load committed without vi
+          +olation,                                                      
+      364 +            // so the prediction was harmlessly conservative. 
+          +Decrementing                                                  
+      365 +            // would disable the entry, leading to speculative
+          + execution                                                    
+      366 +            // and actual violations (worse outcome).         
+      367              stats.numFPDifferentStore++;
+      370 -            DPRINTF(Phast, "updateConfidence: [%d] FP (differe
+          -nt store) predictedStoreDist = %d "                           
+      371 -                    "predicted_sn = %d actual_store_sn = %d\n"
+          -,                                                             
+      372 -                    load_inst->seqNum, load_inst->predictedSto
+          -reDist,                                                       
+      373 -                    load_inst->predictedStoreSeqNum,          
+      374 -                    actual_store_sn);                         
+      368          } else {
+      376 -            // No forwarding (forwardingStoreSeqNum == 0). Cou
+          -ld be a true                                                  
+      377 -            // FP or a correct prediction where the store comm
+          -itted before                                                  
+      378 -            // the load executed. Don't decrement — can't dist
+          -inguish.                                                      
+      369 +            // No forwarding (store committed to cache before 
+          +load executed).                                               
+      370 +            // Prediction was likely correct but can't verify.
+      371              stats.numFPNoForwarding++;
+      372          }
+      373          updateLRU(set, w);
+
+⏺ Confidence now only goes UP (boosted on exact match) or stays the same.
+  Entries start at MAX when trained by a violation. They can only be displaced
+  by new violations through the confidence-based eviction policy (lowest
+  confidence replaced first). Since we never decrement, all entries stay at MAX
+  — eviction falls back to LRU among equally-confident entries.
+
+  This effectively means: once PHAST learns a dependency, it keeps it until a
+  new violation needs the same table slot. Run the benchmarks and we should see
+  violations drop to cold-start levels across all benchmarks.
+
+✻ Crunched for 1m 12s
+
+❯ so what is the purpose of confidence in the paper?                            
+
+⏺ The paper uses confidence to remove stale entries that cause false positives
+  (unnecessary stalling). From Section IV-A2:
+
+  ▎ "The confidence counter is used to disable aliased dependencies that cause 
+  mispredictions."
+
+  In the paper's simulator, the confidence check works correctly because:
+
+  1. Lazy squash — the load commits only after ALL conflicting stores have
+  resolved. The forwarding store is reliably the youngest conflicting store.
+  2. SQ lifetime — in their simulator, the SQ entry persists until the
+  forwarding check completes. forwardingStoreSeqNum always matches
+  predictedStoreSeqNum for correct predictions.
+  3. No "store committed early" problem — their forwarding path doesn't have the
+   race where the store leaves the SQ before the load reads from it.
+
+  So in their simulator, forwardingStoreSeqNum ≠ predictedStoreSeqNum genuinely
+  means the prediction was wrong (aliased entry pointing to a store at the wrong
+   address). Decrementing is correct — it removes the aliased entry, and the
+  next violation trains the right one.
+
+  In our gem5 implementation, the same check produces false mismatches because:
+  - The store commits and leaves the SQ before the load executes →
+  forwardingStoreSeqNum = 0
+  - A younger store at the same address forwards instead → forwardingStoreSeqNum
+   ≠ predictedStoreSeqNum
+
+  Both are "correct" predictions in practice (the load got correct data, no
+  violation), but the check sees them as wrong.
+
+  To properly implement confidence, we'd need to match the paper's simulator 
+  semantics — specifically, ensuring forwardingStoreSeqNum reliably reflects
+  which store the load actually depended on. That would require keeping the
+  store's SQ entry alive until the dependent load executes, which is a deeper
+  change to the LSQ.

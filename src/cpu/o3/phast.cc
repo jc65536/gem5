@@ -365,15 +365,9 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             // genuine false positive. Decrement confidence.
             stats.numIncorrectPredictions++;
             stats.numFPDifferentStore++;
-            DPRINTF(Phast, "updateConfidence: [%d] FP (different store) predictedStoreDist = %d "
-                    "predicted_sn = %d actual_store_sn = %d\n",
-                    load_inst->seqNum, load_inst->predictedStoreDist,
-                    load_inst->predictedStoreSeqNum,
-                    actual_store_sn);
         } else {
-            // No forwarding (forwardingStoreSeqNum == 0). Could be a true
-            // FP or a correct prediction where the store committed before
-            // the load executed. Don't decrement — can't distinguish.
+            // No forwarding (store committed to cache before load executed).
+            // Prediction was likely correct but can't verify.
             stats.numFPNoForwarding++;
             updateLRU(set, w);
         }
