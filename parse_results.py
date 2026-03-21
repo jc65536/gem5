@@ -60,6 +60,10 @@ def parse_results(predictor: str) -> dict[str, dict[str, int | float]]:
                         results["numFPNoForwarding"][b] = int(numFPNoForwarding)
                     case ["board.processor.cores.core.phast0.numFPDifferentStore", numFPDifferentStore]:
                         results["numFPDifferentStore"][b] = int(numFPDifferentStore)
+                    case ["board.processor.cores.core.phast0.numCorrectPredictions", correct]:
+                        results["numCorrectPredictions"][b] = int(correct)
+                    case ["board.processor.cores.core.phast0.numIncorrectPredictions", incorrect]:
+                        results["numIncorrectPredictions"][b] = int(incorrect)
     
     # json.dump(results, sys.stdout, indent=2)
     return results
@@ -90,14 +94,23 @@ def main():
                     val = benchmarks[b]
                     print(f"{"ss":10}{metric:30}{val}")
     else:
-        print(f"\nAverage:")
-        for metric, benchmarks in results["phast"].items():
-            avg = np.average([x for x in benchmarks.values()])
-            print(f"{"phast":10}{metric:30}{avg}")
+        for metric in results["phast"].keys():
+            print(f"\nMetric: {metric}")
+            print(f"{"bench":20}, {"phast":20}, {"ss":20}")
+            for b in benches:
+                if isinstance(results["phast"][metric][b],float):
+                    print(f"{b:20}, {results["phast"][metric][b]:<20.4f}, {results["ss"][metric][b]:<20.4f}")
+                else:
+                    print(f"{b:20}, {results["phast"][metric][b]:<20}, {results["ss"][metric][b]:<20}")
 
-        for metric, benchmarks in results["ss"].items():
-            avg = np.average([x for x in benchmarks.values()])
-            print(f"{"ss":10}{metric:30}{avg}")
+        # print(f"\nAverage:")
+        # for metric, benchmarks in results["phast"].items():
+        #     avg = np.average([x for x in benchmarks.values()])
+        #     print(f"{"phast":10}{metric:30}{avg}")
+
+        # for metric, benchmarks in results["ss"].items():
+        #     avg = np.average([x for x in benchmarks.values()])
+        #     print(f"{"ss":10}{metric:30}{avg}")
 
 
 if __name__ == "__main__":

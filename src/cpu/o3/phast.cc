@@ -359,12 +359,10 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             set[w].confidence = MAX_CONFIDENCE;
             stats.numCorrectPredictions++;
             DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
+            updateLRU(set, w);
         } else if (actual_store_sn != 0) {
             // Forwarding came from a different store than predicted —
             // genuine false positive. Decrement confidence.
-            if (set[w].confidence > 0) {
-                set[w].confidence--;
-            }
             stats.numIncorrectPredictions++;
             stats.numFPDifferentStore++;
             DPRINTF(Phast, "updateConfidence: [%d] FP (different store) predictedStoreDist = %d "
@@ -377,8 +375,8 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             // FP or a correct prediction where the store committed before
             // the load executed. Don't decrement — can't distinguish.
             stats.numFPNoForwarding++;
+            updateLRU(set, w);
         }
-        updateLRU(set, w);
     } else {
         stats.numPredictionsNotFound++;
         DPRINTF(Phast, "updateConfidence: [%d] committed prediction not found\n", load_inst->seqNum);
