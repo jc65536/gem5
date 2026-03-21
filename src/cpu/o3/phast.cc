@@ -137,8 +137,7 @@ Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
     if (load_inst->phastDecodeBranchCount > store_inst->phastDecodeBranchCount) {
         hist_len = load_inst->phastDecodeBranchCount - store_inst->phastDecodeBranchCount;
     }
-    DPRINTF(Phast, "violation: store_inst phastDecodeBranchCount %d\n", store_inst->phastDecodeBranchCount);
-    DPRINTF(Phast, "violation: load_inst phastDecodeBranchCount %d\n", load_inst->phastDecodeBranchCount);
+
     DPRINTF(Phast, "violation: hist_len %d\n", hist_len);
 
     int target_table_idx = tables.size() - 1;
@@ -176,13 +175,18 @@ Phast::violation(const DynInstPtr &store_inst, const DynInstPtr &load_inst)
         updateLRU(set, hit_way);
     } else {
         int repl_way = 0;
+        int min_confidence = INT_MAX;
         int max_lru = -1;
         for (int w = 0; w < NUM_WAYS; ++w) {
             if (!set[w].valid) {
                 repl_way = w;
                 break;
             }
-            if (set[w].lru > max_lru) {
+            if (set[w].confidence < min_confidence) {
+                min_confidence = set[w].confidence;
+                max_lru = set[w].lru;
+                repl_way = w;
+            } else if (set[w].confidence == min_confidence && set[w].lru > max_lru) {
                 max_lru = set[w].lru;
                 repl_way = w;
             }
@@ -349,8 +353,7 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
     int w = load_inst->predictedWayInSet;
 
     if (set[w].valid && set[w].tag == load_inst->predictedTag) {
-        InstSeqNum predicted_forwarding_store_seq_num = load_inst->predictedStoreSeqNum;
-        bool is_correct = load_inst->forwardingStoreSeqNum == predicted_forwarding_store_seq_num;
+        bool is_correct = load_inst->forwardingStoreSeqNum == load_inst->predictedStoreSeqNum;
         if (is_correct) {
             set[w].confidence = MAX_CONFIDENCE;
             stats.numCorrectPredictions++;
@@ -367,7 +370,7 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             DPRINTF(Phast, "updateConfidence: [%d] FP prediction committed predictedStoreDist = %d "
                     "predicted_sn = %d forwarding_sn = %d\n",
                     load_inst->seqNum, load_inst->predictedStoreDist,
-                    predicted_forwarding_store_seq_num,
+                    load_inst->predictedStoreSeqNum,
                     load_inst->forwardingStoreSeqNum);
         }
         updateLRU(set, w);
