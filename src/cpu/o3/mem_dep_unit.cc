@@ -260,8 +260,17 @@ MemDepUnit::insert(const DynInstPtr &inst)
         MemDepHashIt hash_it = memDepHash.find(producing_store);
 
         if (hash_it != memDepHash.end()) {
-            store_entries.push_back((*hash_it).second);
-            DPRINTF(MemDepUnit, "Producer found\n");
+            MemDepEntryPtr entry = (*hash_it).second;
+            // PHAST: If the store already executed (completed=true), don't
+            // create a dependency — wakeDependents already ran and won't
+            // run again. The load can execute and get data via SQ forwarding.
+            if (entry->completed) {
+                DPRINTF(MemDepUnit, "Producer [sn:%lli] already executed, "
+                        "skipping dependency\n", producing_store);
+            } else {
+                store_entries.push_back(entry);
+                DPRINTF(MemDepUnit, "Producer found\n");
+            }
         } else if (usePhast && producing_store != 0) {
             phastPred.stats.checkInstProducerNotInHash++;
             DPRINTF(MemDepUnit, "PHAST: Producer [sn:%lli] not in hash! "
@@ -474,9 +483,13 @@ MemDepUnit::completeInst(const DynInstPtr &inst)
     // dispatched after the store executes can still find it and establish
     // dependencies. Without this, storeDistToSeqNum returns a valid seqNum
     // but memDepHash.find() fails (producerNotInHash).
+    // Mark the entry as completed so loads know the store already executed
+    // and don't wait on it (wakeDependents won't run again).
     if (usePhast && (inst->isStore() || inst->isAtomic()) &&
         !inst->isReadBarrier() && !inst->isWriteBarrier() &&
         !inst->isHtmCmd()) {
+        MemDepEntryPtr entry = findInHash(inst);
+        entry->completed = true;
         return;
     }
 

@@ -400,9 +400,7 @@ class InstructionQueue
 
   public:
     Phast* getPhast(ThreadID tid) { return memDepUnit[tid].getPhast(); }
-    void commitStore(const DynInstPtr &inst) {
-        memDepUnit[inst->threadNumber].commitStore(inst);
-    }
+    void commitStore(const DynInstPtr &inst);
 
   private:
     /** The queue to the execute stage.  Issued instructions will be written

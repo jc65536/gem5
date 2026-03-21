@@ -1699,5 +1699,9 @@ InstructionQueue::dumpInsts()
     }
 }
 
+void InstructionQueue::commitStore(const DynInstPtr &inst) {
+    memDepUnit[inst->threadNumber].commitStore(inst);
+}
+
 } // namespace o3
 } // namespace gem5
