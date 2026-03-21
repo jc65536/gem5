@@ -353,12 +353,13 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
     int w = load_inst->predictedWayInSet;
 
     if (set[w].valid && set[w].tag == load_inst->predictedTag) {
-        bool is_correct = load_inst->forwardingStoreSeqNum == load_inst->predictedStoreSeqNum;
+        uint64_t actual_store_sn = load_inst->forwardingStoreSeqNum;
+        bool is_correct = actual_store_sn == load_inst->predictedStoreSeqNum;
         if (is_correct) {
             set[w].confidence = MAX_CONFIDENCE;
             stats.numCorrectPredictions++;
             DPRINTF(Phast, "updateConfidence: [%d] TP prediction committed predictedStoreDist = %d\n", load_inst->seqNum, load_inst->predictedStoreDist);
-        } else if (load_inst->forwardingStoreSeqNum != 0) {
+        } else if (actual_store_sn != 0) {
             // Forwarding came from a different store than predicted —
             // genuine false positive. Decrement confidence.
             if (set[w].confidence > 0) {
@@ -367,10 +368,10 @@ Phast::updateConfidence(const DynInstPtr &load_inst)
             stats.numIncorrectPredictions++;
             stats.numFPDifferentStore++;
             DPRINTF(Phast, "updateConfidence: [%d] FP (different store) predictedStoreDist = %d "
-                    "predicted_sn = %d forwarding_sn = %d\n",
+                    "predicted_sn = %d actual_store_sn = %d\n",
                     load_inst->seqNum, load_inst->predictedStoreDist,
                     load_inst->predictedStoreSeqNum,
-                    load_inst->forwardingStoreSeqNum);
+                    actual_store_sn);
         } else {
             // No forwarding (forwardingStoreSeqNum == 0). Could be a true
             // FP or a correct prediction where the store committed before
